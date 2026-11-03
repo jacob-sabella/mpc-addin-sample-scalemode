@@ -1,0 +1,5 @@
+ADDIN_ID=enable-scalemode
+ADDIN_NAME="Enable Scale Mode"
+ADDIN_SO=mpc_enable_scalemode.so
+ADDIN_CONF=mpc_enable_scalemode.conf
+ADDIN_FILES=""
