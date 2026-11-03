@@ -361,45 +361,70 @@ static int try_patch(struct mpc_mapping *m)
     }
 
     /*
-     * Step 3: Find the PadPerformSettings initialization.
+     * Step 3: Find the PadPerformSettings "supported" bool.
      *
-     * The PadPerformSettingsBase constructor takes a bool parameter that
-     * controls whether PadPerform is "supported" on this hardware.
-     * The RTTI confirms: PadPerformSettingsBase::PadPerformSettingsBase(bool).
+     * The engine init function constructs PadPerformSettings and passes a
+     * bool that controls whether PadPerform is available. This bool is
+     * loaded from a capability struct: LDRB Wn, [Xm, #432].
      *
-     * We look for where this constructor is called. The call site will have
-     * a MOV W1, #0 (false) or MOV W1, #1 (true) before the BL. On gated
-     * models, the bool is false. We patch it to true.
+     * The padPerformButton string is referenced by the PadPerformSettings
+     * constructor, which is called from the engine init. We find the
+     * constructor's BL callers in the engine init, then look backward for
+     * the LDRB that loads the bool.
+     *
+     * If we find a LDRB Wn, [Xm, #432] near a BL to a function that
+     * also references "padPerformButton", we can patch it to MOV Wn, #1
+     * to force PadPerform enabled.
      */
 
-    /* Look for a function that references "PadPerform.Type" — this is near
-     * the settings initialization code. */
-    if (pps_str) {
-        uintptr_t search = m->text_start;
-        for (int i = 0; i < 10; i++) {
-            uintptr_t ref = find_adrp_add_ref(search, m->text_end - search, pps_str);
-            if (!ref) break;
-
-            /* Check instructions around this ref for a MOV W1, #0 → BL pattern
-             * within the preceding 32 instructions that constructs settings. */
-            for (uintptr_t pc = ref - 128; pc < ref; pc += 4) {
-                uint32_t w = insn_at(pc);
-                /* MOV W1, #0 (MOVZ W1, #0) = 0x52800001 */
-                if (w == 0x52800001) {
-                    uint32_t next = insn_at(pc + 4);
-                    /* BL to some function */
-                    if ((next & 0xFC000000) == 0x94000000) {
-                        uintptr_t target = decode_bl(pc + 4);
-                        LOG("  potential PadPerformSettingsBase(false) at %p → BL %p",
-                            (void *)pc, (void *)target);
-                    }
-                }
-            }
-
-            search = ref + 4;
+    /* Find the function containing the padPerformButton reference. This is
+     * the PadPerformSettings constructor (or a close helper). */
+    uintptr_t ctor_func = 0;
+    for (uintptr_t pc = ppb_ref; pc >= m->text_start && pc > ppb_ref - 8192; pc -= 4) {
+        uint32_t w = insn_at(pc);
+        if (w == 0xD503233F || /* PACIASP */
+            (w & 0xFFE003FF) == 0xA98003FD) { /* STP X29, X30, [SP, #-N]! */
+            ctor_func = pc;
+            break;
         }
     }
+    if (ctor_func)
+        LOG("PadPerformSettings ctor at %p", (void *)ctor_func);
 
+    /* Find callers of the constructor in .text — these are in the engine init. */
+    if (ctor_func) {
+        for (uintptr_t pc = m->text_start; pc < m->text_end; pc += 4) {
+            uint32_t w = insn_at(pc);
+            if ((w & 0xFC000000) != 0x94000000) continue;
+            uintptr_t target = decode_bl(pc);
+            if (target != ctor_func) continue;
+
+            LOG("  BL to ctor at %p", (void *)pc);
+
+            /* Search backward from this BL for LDRB Wn, [Xm, #432].
+             * The bool is loaded ~16-60 instructions before the BL. */
+            for (uintptr_t scan = pc - 4; scan >= pc - 256 && scan >= m->text_start; scan -= 4) {
+                uint32_t sw = insn_at(scan);
+                /* LDRB Wt, [Xn, #432]: 0x39400000 | (432<<10) = 0x3946C000 */
+                if ((sw & 0xFFFFFC00) == 0x3946C000) {
+                    unsigned rt = sw & 0x1F;
+                    unsigned rn = (sw >> 5) & 0x1F;
+                    LOG("  found LDRB W%u, [X%u, #432] at %p (PadPerform supported flag)",
+                        rt, rn, (void *)scan);
+
+                    /* Patch: LDRB → MOV Wrt, #1 (0x52800020 | rt) */
+                    uint32_t mov_w1 = 0x52800020 | rt;
+                    if (patch_insn(scan, sw, mov_w1) == 0) {
+                        patches_applied++;
+                        LOG("  PadPerform bool forced to true");
+                    }
+                    goto after_ctor_search;
+                }
+            }
+        }
+    }
+after_ctor_search:
+    ;
     /*
      * Step 4: Look for the hardware type comparison gate.
      *
