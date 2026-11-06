@@ -158,6 +158,26 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
    toggles and gives it back when idle.
 6. A socket server on `/tmp/padmode.sock` accepts `padctl` commands.
 
+## Credits
+
+Scale playing on the MPC Sample was first done by
+[SampQOL OS](https://github.com/snarebes/SampQOL-OS), the free SD-card mod for the
+MPC Sample by [snarebes](https://github.com/snarebes). This addin is built on that work:
+
+- **Where to hook.** The firmware functions it hooks are the ones SampQOL OS uses for its
+  Scale feature: the note mapping MPC runs for each 16 Levels slot, the 16 Levels Type
+  cycle and the 16 Levels button.
+- **How a slot becomes a note.** Its slot-to-note math follows SampQOL OS: the scale's
+  interval for the slot, whole octaves for the slots past the first octave plus the octave
+  offset, the root moved by at most half an octave, a -24 base, clamped to ±120, and the
+  same field in the pad's note event cleared before the note is set.
+
+SampQOL OS is closed-source freeware that runs from an SD card. This
+addin is a separate implementation of the idea as an addin that loads with the stock
+firmware. What it adds: the hold gesture, the SCALE page (through the draw handler),
+starting from the sample's own root note, and pitch detection for untagged samples.
+The two hook the same functions and haven't been tested together: use one or the other.
+
 ## License
 
 MIT
