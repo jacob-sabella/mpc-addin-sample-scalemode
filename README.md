@@ -84,6 +84,8 @@ padctl hookhits     # how many times the hook has fired
 - **Type names not mapped yet.** `padctl` prints the native Type as a number
   (0-2); which number is Tune, Velocity or Filter is still being checked on
   hardware, and so is the default `scale_slot`.
+- **Reinstall after a reboot.** On the Sample the shared installer puts the
+  `LD_PRELOAD` drop-in on `/run`, which is tmpfs; the installer says so.
 - **Hook requires physical pad press.** The note mapping function is only
   called from the analog pad hardware handler (UART serial path). MIDI
   injection via ALSA or the kernel module does not reach it.
