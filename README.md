@@ -1,35 +1,34 @@
 # Enable Scale Mode
 
-An addin for the Akai MPC that enables the built-in Pad Perform / Scale Mode on
-devices where the feature is compiled into the firmware but not exposed in the UI.
+An addin for the MPC Sample that enables Pad Perform / Scale Mode.
 
-The MPC firmware contains the complete PadPerform system — settings, dialogue,
-MIDI note filtering, pad lighting, settings persistence — and the pad-mode
-cycling function already includes PadPerform as mode 1 (Full Level -> 16 Level
--> Pad Perform -> Full Level). On some models the mode is gated by a
-hardware-type generation check that prevents it from activating.
+The firmware contains the complete PadPerform system — mode cycling, note
+mapping, settings structures — but the UI never exposes it. This addin
+patches the firmware at runtime to unlock it, and hooks the note mapping
+function to remap pads through configurable scale tables.
 
-This addin locates those gates at runtime via AArch64 signature scanning and
-patches them so the native Pad Perform code path activates.
+## What it does
 
-## Status
+1. **Patches the PadPerform bool** so the firmware treats it as supported
+2. **Patches the notification loop** in `set_mode` so mode changes don't hang
+3. **Hooks the note mapping function** with a PACIASP trampoline that remaps
+   pad presses through scale intervals when in Pad Perform mode (mode 1)
+4. **Provides `padctl`** — a CLI to cycle modes, change scales, and query status
 
-**Work in progress.** The addin framework, signature scanner, and generation-gate
-detector are in place. Needs hardware testing to confirm:
+## Scales
 
-1. Whether the native pad-mode cycling reaches Pad Perform when the generation
-   gate is patched
-2. Whether the mode functions correctly once reachable (pad lighting, note
-   mapping, settings)
+8 built-in scales: Chromatic, Major, Minor, Harmonic Minor, Dorian, Blues,
+Phrygian, Mixolydian. Default: Blues, root C3.
+
+With 4 pads in Blues/C3: pad 0 = C3, pad 1 = Eb3, pad 2 = F3, pad 3 = F#3.
 
 ## Install
 
-Build the `.so`, copy the build output to the device, and install via the
-shared addin mechanism:
-
 ```sh
-./build.sh
-# then install via the addin installer
+make build         # cross-compile for aarch64 (needs Docker)
+make release       # package the dist zip
+# copy to device and run install.sh, or:
+make deploy MPC_HOST=root@<device-ip>
 ```
 
 ## Settings
@@ -37,35 +36,48 @@ shared addin mechanism:
 `mpc_enable_scalemode.conf` next to the `.so`:
 
 ```
-enabled=1    # 0 to load the library but skip the patch
+enabled=1          # 0 to load but skip all patches
+scale=Blues        # Chromatic, Major, Minor, Harm Minor, Dorian, Blues, Phrygian, Mixolydian
+root=C3            # note name with octave, or MIDI number (0-127)
+octave_offset=0    # shift all notes up/down (-4 to 4)
 ```
 
-Set `MPC_ENABLE_SCALEMODE_DISABLE=1` in the environment to disable without
-editing the config.
+Settings are read on each MPC startup.
+
+## Runtime commands (padctl)
+
+```sh
+padctl status       # mode, scale, root, hook state
+padctl cycle        # cycle pad mode: Full Level -> 16 Level -> Pad Perform
+padctl scale Blues   # change scale (prefix match, case-insensitive)
+padctl root A2      # change root note
+padctl octave -1    # shift octave offset
+padctl scaleinfo    # current scale config
+padctl testmap 0    # dry-run: show what MIDI note pad 0 would produce
+padctl hookhits     # how many times the hook has fired
+```
+
+## Known limitations
+
+- **No on-screen scale UI.** The Sample's 320x240 non-touch screen has no
+  built-in Pad Perform settings dialogue. Use `padctl` over SSH or edit the
+  conf file for settings. The pad mode indicator (Full Level / 16 Level /
+  Pad Perform) is handled natively by the firmware.
+- **Hook requires physical pad press.** The note mapping function is only
+  called from the analog pad hardware handler (UART serial path). MIDI
+  injection via ALSA or the kernel module does not reach it.
 
 ## How it works
 
-1. The `.so` is loaded into the MPC process via `LD_PRELOAD` (the standard
-   addin mechanism).
-2. A background thread scans the MPC binary's memory regions for PadPerform
-   infrastructure markers (`padPerformButton`, `PadPerform.Type`, `16 Level`).
-3. It locates the pad-mode cycling function and verifies the 3-mode switch
-   (modes 0, 1, 2) is present.
-4. It searches for an inlined hardware-generation gate near the PadPerform
-   code — the pattern that compares the hardware type enum against tier
-   thresholds (4, 9, 19, 24, 29).
-5. If found, the gate's conditional branch is patched to NOP, allowing the
-   native PadPerform code to activate regardless of hardware tier.
-
-No reimplementation of scale mode logic — this enables what's already there.
-
-## Technical details
-
-- **ADA2PadMode enum**: 0 = Full Level, 1 = Pad Perform, 2 = 16 Level
-- **Button enum**: PAD_PERFORM = 94
-- **Cycle order**: 0 -> 2 -> 1 -> 0 (pressing 16 Level button cycles modes)
-- **Gate mechanism**: Hardware type enum is compared against generation
-  thresholds; PadPerform requires Gen2+ (enum value > 9)
+1. The `.so` is loaded via `LD_PRELOAD` (standard addin mechanism).
+2. A background thread scans MPC's memory for PadPerform markers
+   (`padPerformButton`, `PadPerform.Type`).
+3. It patches the PadPerform constructor bool (`LDRB` → `MOV #1`) and
+   the notification loop (`B.EQ` → unconditional `B`).
+4. It hooks the note mapping function (base+0x21472f0) with a PACIASP
+   trampoline that intercepts pad events in mode 1 and remaps them
+   through scale tables via the note setter (base+0x27e4400).
+5. A socket server on `/tmp/padmode.sock` accepts `padctl` commands.
 
 ## License
 
