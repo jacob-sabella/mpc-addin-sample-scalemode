@@ -23,6 +23,10 @@ up for as long as Scale is on; after the hold that turns Scale off it gives the
 screen back to MPC a few seconds later. Changes are saved to the settings file and survive a restart; Scale
 itself starts off each time MPC starts.
 
+Recording works as with 16 Levels: hits recorded into a sequence (Overdub while it
+plays) keep their scale notes, stored as each event's coarse tuning, and play back at
+those pitches with Scale off too (checked on an MPC Sample, firmware 1.3.0.12, 2026-11-06).
+
 The page needs the [MPC Sample draw handler](https://github.com/jacob-sabella/mpc-addin-sample-draw-handler)
 addin (0.5.0 or later). Without it, holding 16 Levels still toggles Scale.
 
