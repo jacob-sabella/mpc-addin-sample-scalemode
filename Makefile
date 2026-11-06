@@ -13,7 +13,7 @@ release: build
 	python3 ../mpc-vst-plugins/tools/release_addin.py \
 		--dir build --version $(VERSION) \
 		--repo $(REPO) --license MIT \
-		--depends "sample-draw-handler>=0.5.0" \
+		--depends "sample-draw-handler>=1.0.1" \
 		--about "Hold 16 Levels on the MPC Sample to play its 16 slots in a scale, set on a SCALE page"
 
 deploy: build
