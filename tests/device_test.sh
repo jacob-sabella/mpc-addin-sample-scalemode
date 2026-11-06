@@ -3,6 +3,8 @@
 # MPC's control-surface stream, filtered like real ones), the screen comes back through the draw handler's /snap.
 # Needs the addin and mpc-addin-sample-draw-handler installed and MPC running. Leaves Scale off and 16 Levels as found.
 #   MPC_HOST=root@<device> [SSH_KEY=~/.ssh/key] tests/device_test.sh [out_dir]
+# AUDIO_SRC=<PulseAudio/PipeWire source of the Sample's USB audio> also records the 16 slots in Blues and checks each one's
+# pitch (tests/pitch_check.py; PITCH_MODE=clicks for a sample with two or more transients, spectrum for a sustained one).
 # RESTART=1 also checks that a scale changed on the page survives an MPC restart (restarts MPC once).
 # out_dir (default build/device-test) gets the page frames while pads play, and page.gif when ffmpeg is installed.
 set -euo pipefail
@@ -56,6 +58,18 @@ dev "rm -rf /tmp/scaletest; mkdir -p /tmp/scaletest; cd /tmp/scaletest
 o=$(owner); [ "${o:-0}" != 0 ] && ok "page stays up while pads play" || bad "page closed while pads played"
 sleep 5
 [ "$(owner)" = 0 ] && ok "page gives the screen back after idle" || bad "page still up after idle"
+
+if [ -n "${AUDIO_SRC:-}" ]; then
+    mkdir -p "$OUT"; sleep 2; was=$(pc status | sed -n 's/.* scale=\([^ ]*\) .*/\1/p'); pc scale Blues >/dev/null
+    timeout 36 parecord -d "$AUDIO_SRC" --file-format=wav --format=s32le --rate=44100 --channels=2 "$OUT/slots.wav" & rec=$!
+    sleep 0.5
+    dev "for n in 37 36 42 82 40 38 46 44 48 47 45 43 49 55 51 53; do $P note 10 \$n 110 1600 >/dev/null; sleep 0.2; done"
+    wait $rec || true; pc scale "$was" >/dev/null
+    BLUES=0,3,5,6,7,10,12,15,17,18,19,22,24,27,29,30
+    if [ "${PITCH_MODE:-clicks}" = clicks ]; then args=(clicks "$OUT/slots.wav" 16 $BLUES); else args=(spectrum "$OUT/slots.wav" 1.0 1.8 16 $BLUES); fi
+    python3 tests/pitch_check.py "${args[@]}" > "$OUT/pitch.txt" && ok "the 16 slots sound in Blues (audio, $OUT/pitch.txt)" \
+        || { bad "slot pitches (audio)"; cat "$OUT/pitch.txt"; }
+fi
 
 hold
 [ "$(scale_on)" = 0 ] && ok "hold again: Scale off" || bad "second hold did not turn Scale off"
