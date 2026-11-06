@@ -7,7 +7,7 @@ docker run --rm --platform linux/arm64 -u "$(id -u):$(id -g)" -v "$PWD":/b -w /b
   set -e
   F="-std=gnu11 -O2 -Wall -Wextra -Werror"
   gcc $F -fPIC -shared -fvisibility=hidden -Wl,-z,defs -Wl,--as-needed \
-    -o build/mpc_enable_scalemode.so src/enable_scalemode.c -lpthread
+    -o build/mpc_enable_scalemode.so src/enable_scalemode.c -lpthread -ldl
   strip --strip-unneeded build/mpc_enable_scalemode.so
   readelf -d build/mpc_enable_scalemode.so | grep NEEDED
 '

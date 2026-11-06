@@ -16,13 +16,16 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -378,6 +381,50 @@ static int try_patch(struct mpc_mapping *m)
     }
 
     /*
+     * Step 2b: Patch set_mode notification crash.
+     *
+     * set_mode (called by the cycling function) crashes at +0xF4 during
+     * the notification listener loop. The code does:
+     *   +0xEC: LDR X2, [X0]          ; load vtable from listener
+     *   +0xF0: MOV W1, W22           ; mode arg
+     *   +0xF4: LDR X2, [X2, #0x28]  ; load vfunc  ← CRASH: bad vtable
+     *   +0xF8: BLR X2                ; call
+     *   +0xFC: B → loop
+     *
+     * On the Sample, one listener's vtable pointer is invalid (points at
+     * executable code instead of a vtable). NOP the vtable deref and the
+     * call so the mode gets stored (at +0x60) and the notification loop
+     * completes without crashing.
+     */
+    if (cycle_func) {
+        uintptr_t set_mode = decode_bl(cycle_func + 0x84);
+        if (set_mode) {
+            LOG("  set_mode at %p (from cycle+0x84)", (void *)set_mode);
+
+            /*
+             * The notification listener loop starts at +0x64 with a
+             * sentinel check:
+             *   +0x60: STR W22, [X20, #0x1C]  ; store new mode ← already done
+             *   +0x64: ADD X21, X20, #8
+             *   +0x68: CMP X19, X21
+             *   +0x6C: B.EQ +0x34 → +0xA0     ; skip if list empty
+             *
+             * Patch B.EQ to unconditional B so the loop is always
+             * skipped. The mode is stored at +0x60 before this point.
+             */
+            uint32_t w_6c = insn_at(set_mode + 0x6C);
+            if (w_6c == 0x540001A0) {
+                if (patch_insn(set_mode + 0x6C, 0x540001A0, 0x1400000D) == 0) {
+                    patches_applied++;
+                    LOG("  notification loop skipped — set_mode won't crash");
+                }
+            } else {
+                LOG("  set_mode+0x6C: 0x%08x (expected 0x540001A0 B.EQ)", w_6c);
+            }
+        }
+    }
+
+    /*
      * Step 3: Find the PadPerformSettings "supported" bool.
      *
      * The engine init loads a bool from the capability struct via
@@ -545,75 +592,504 @@ static int try_patch(struct mpc_mapping *m)
  */
 
 static uintptr_t g_cycle_func;
+static uintptr_t g_set_mode_func; /* set_mode(inner+0x18, mode) called by the cycling function */
 static uintptr_t g_this_global; /* address of the global that holds `this` */
+static void *g_this_direct;     /* direct this pointer (vtable scan) */
+static pthread_t g_main_thread; /* main thread ID for signal-based dispatch */
+static volatile int g_pending_setmode = -1; /* mode to set from main thread, -1 = idle */
+static volatile int g_setmode_result = -99; /* result written by signal handler */
+static volatile int g_direct_target = -1;   /* >= 0: call set_mode directly instead of cycle */
 
 static void *resolve_this_ptr(void)
 {
-    if (!g_this_global) return NULL;
-    void *ptr = *(void *volatile *)g_this_global;
-    return ptr;
+    if (g_this_direct) return g_this_direct;
+    if (g_this_global) return *(void *volatile *)g_this_global;
+    return NULL;
+}
+
+typedef void (*set_mode_fn_t)(void *obj, int mode);
+typedef void (*cycle_fn_t)(void *self);
+
+/*
+ * poll() interposition: the MPC event loop calls poll() on every iteration.
+ * We hook it to run the cycling function on the main thread during normal
+ * execution (not from a signal handler), which lets the full notification
+ * chain work safely.
+ */
+#include <dlfcn.h>
+#include <poll.h>
+
+static int (*real_poll)(struct pollfd *, nfds_t, int);
+static volatile sig_atomic_t s_in_poll_cycle;
+
+static sigjmp_buf s_poll_jmpbuf;
+
+static void poll_segv_handler(int sig, siginfo_t *si, void *ctx)
+{
+    if (s_in_poll_cycle) {
+        uintptr_t fault_addr = si ? (uintptr_t)si->si_addr : 0;
+        uintptr_t pc = 0;
+#ifdef __aarch64__
+        if (ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            pc = uc->uc_mcontext.pc;
+        }
+#endif
+        LOG("SEGV: fault_addr=%p pc=%p", (void *)fault_addr, (void *)pc);
+        siglongjmp(s_poll_jmpbuf, sig);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+__attribute__((visibility("default")))
+int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    if (!real_poll) real_poll = dlsym(RTLD_NEXT, "poll");
+
+    if (!s_in_poll_cycle &&
+        g_pending_setmode >= 0 &&
+        pthread_self() == g_main_thread &&
+        g_cycle_func && resolve_this_ptr())
+    {
+        void *volatile self = resolve_this_ptr();
+
+        struct sigaction sa = {0}, old_segv;
+        sa.sa_sigaction = poll_segv_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &old_segv);
+
+        s_in_poll_cycle = 1;
+        int direct = g_direct_target;
+        int crashed = sigsetjmp(s_poll_jmpbuf, 1);
+        if (!crashed) {
+            if (direct >= 0 && g_set_mode_func) {
+                uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+                void *obj = (void *)(inner + 0x18);
+                LOG("calling set_mode(%p, %d) directly", obj, direct);
+                ((set_mode_fn_t)g_set_mode_func)(obj, direct);
+            } else {
+                ((cycle_fn_t)g_cycle_func)(self);
+            }
+        } else {
+            LOG("%s crashed in poll hook (signal %d)",
+                direct >= 0 ? "set_mode" : "cycle", crashed);
+        }
+        s_in_poll_cycle = 0;
+        g_direct_target = -1;
+
+        sigaction(SIGSEGV, &old_segv, NULL);
+
+        uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+        int mode = inner ? *(volatile int32_t *)(inner + 0x34) : -1;
+        g_setmode_result = (crashed ? 100 + mode : mode);
+        g_pending_setmode = -1;
+    }
+
+    return real_poll(fds, nfds, timeout);
 }
 
 static int find_this_pointer(struct mpc_mapping *m, uintptr_t cycle_func)
 {
+    int bl_count = 0;
+
     for (uintptr_t pc = m->text_start; pc < m->text_end; pc += 4) {
         if (decode_bl(pc) != cycle_func) continue;
+        bl_count++;
 
-        LOG("  BL to cycle func at %p", (void *)pc);
+        LOG("  BL to cycle func at %p (offset 0x%lx)",
+            (void *)pc, (unsigned long)(pc - m->base));
 
-        /* Walk backward up to 64 instructions looking for LDR X0, [Xn, #off]. */
+        /*
+         * Walk backward looking for how X0 (this) was set.
+         * Pattern 1: LDR X0, [Xn, #off] where Xn came from ADRP (global pointer)
+         * Pattern 2: MOV X0, Xm then trace Xm the same way
+         */
+        unsigned target_reg = 0; /* register we're tracing (start with X0) */
         for (uintptr_t s = pc - 4; s >= m->text_start && s >= pc - 256; s -= 4) {
             uint32_t w = insn_at(s);
 
-            /* LDR Xt, [Xn, #imm12]:  1x11 1001 01ii iiii iiii iinn nnnt tttt
-             * We want Xt = X0 (bits 4:0 = 0), 64-bit (bit 30 = 1). */
-            if ((w & 0xFFC0001F) != 0xF9400000) continue;
+            /* MOV Xd, Xm  (ORR Xd, XZR, Xm): 0xAA0003E0 | Rm<<16 | Rd */
+            if ((w & 0xFFE0FFE0) == 0xAA0003E0) {
+                unsigned rd = w & 0x1F;
+                unsigned rm = (w >> 16) & 0x1F;
+                if (rd == target_reg) {
+                    LOG("    MOV X%u, X%u at %p", rd, rm, (void *)s);
+                    target_reg = rm;
+                    continue;
+                }
+            }
 
-            unsigned rn = (w >> 5) & 0x1F;
-            unsigned imm12 = (w >> 10) & 0xFFF;
-            uintptr_t offset = (uintptr_t)imm12 << 3; /* scaled by 8 for 64-bit LDR */
+            /* LDR Xt, [Xn, #imm12] (64-bit): F940_0000 | imm12<<10 | Rn<<5 | Rt */
+            if ((w & 0xFFC00000) == 0xF9400000) {
+                unsigned rt = w & 0x1F;
+                unsigned rn = (w >> 5) & 0x1F;
+                unsigned imm12 = (w >> 10) & 0xFFF;
+                uintptr_t offset = (uintptr_t)imm12 << 3;
 
-            /* Now find ADRP Xrn within a few instructions before. */
-            for (uintptr_t a = s - 4; a >= m->text_start && a >= s - 32; a -= 4) {
-                unsigned adrp_rd;
-                uintptr_t page = decode_adrp(a, &adrp_rd);
-                if (!page || adrp_rd != rn) continue;
+                if (rt != target_reg) continue;
 
-                uintptr_t global = page + offset;
+                LOG("    LDR X%u, [X%u, #0x%lx] at %p",
+                    rt, rn, (unsigned long)offset, (void *)s);
 
-                /* Sanity: the global should be in a readable range and hold a
-                 * pointer-sized value that looks like a heap/stack address. */
-                if (global < m->ro_start || global >= m->ro_end) continue;
+                /* Find ADRP Xrn within a few instructions before. */
+                for (uintptr_t a = s - 4; a >= m->text_start && a >= s - 48; a -= 4) {
+                    unsigned adrp_rd;
+                    uintptr_t page = decode_adrp(a, &adrp_rd);
+                    if (!page || adrp_rd != rn) continue;
 
-                void *ptr = *(void *volatile *)global;
-                if (!ptr) continue;
+                    uintptr_t global = page + offset;
+                    LOG("    ADRP X%u → page %p, global = %p",
+                        rn, (void *)page, (void *)global);
 
-                /* Validate: the object at this+0x34 should hold a valid mode (0-2). */
-                uintptr_t this_addr = (uintptr_t)ptr;
-                int32_t mode = *(volatile int32_t *)(this_addr + 0x34);
-                if (mode < 0 || mode > 2) continue;
+                    /* The global could be in .data/.bss (rw), not just .rodata */
+                    if (global < m->base) continue;
 
-                LOG("  this global at %p → %p (mode=%d)",
-                    (void *)global, ptr, mode);
-                g_this_global = global;
-                return 0;
+                    void *ptr = *(void *volatile *)global;
+                    if (!ptr) {
+                        LOG("    global is NULL (object not constructed yet?)");
+                        continue;
+                    }
+
+                    uintptr_t this_addr = (uintptr_t)ptr;
+                    int32_t mode = *(volatile int32_t *)(this_addr + 0x34);
+
+                    LOG("    *global = %p, *(this+0x34) = %d", ptr, mode);
+
+                    if (mode < 0 || mode > 2) continue;
+
+                    LOG("  this global at %p → %p (mode=%d)",
+                        (void *)global, ptr, mode);
+                    g_this_global = global;
+                    return 0;
+                }
+
+                /* If ADRP wasn't found, the base register might come from
+                 * further back — continue tracing it. */
+                target_reg = rn;
             }
         }
     }
-    LOG("  could not find this pointer for cycling function");
+
+    if (bl_count == 0)
+        LOG("  no BL to cycle func — trying vtable scan");
+    else {
+        LOG("  found %d BL(s) but could not resolve this pointer — trying vtable scan",
+            bl_count);
+    }
+
+    /*
+     * Pointer-scan approach: the cycling function's address must appear
+     * somewhere in readable memory — a vtable, a std::function, a JUCE
+     * listener list, or a heap-allocated callback.  Scan ALL readable
+     * non-executable segments (not just MPC binary pages) for the raw
+     * function pointer.
+     *
+     * Re-parse /proc/self/maps so we only touch mapped pages.
+     */
+    uintptr_t fptr_loc = 0;
+
+    FILE *mf = fopen("/proc/self/maps", "re");
+    if (mf) {
+        char line[512];
+        while (fgets(line, sizeof line, mf) && !fptr_loc) {
+            unsigned long a, b;
+            char perms[8] = {0};
+            if (sscanf(line, "%lx-%lx %4s", &a, &b, perms) < 3) continue;
+            if (perms[0] != 'r' || perms[2] == 'x') continue;
+            if ((b - a) > (256UL << 20)) continue; /* cap at 256 MB */
+
+            for (uintptr_t p = (uintptr_t)a; p < (uintptr_t)b - 8; p += 8) {
+                if (*(volatile uintptr_t *)p == cycle_func) {
+                    fptr_loc = p;
+                    LOG("  cycle func pointer at %p (segment %lx-%lx)",
+                        (void *)p, a, b);
+                    break;
+                }
+            }
+        }
+        fclose(mf);
+    }
+
+    if (!fptr_loc) {
+        LOG("  cycle func address not found in any readable segment");
+        return -1;
+    }
+
+    /* Dump context around the function pointer for data-structure analysis. */
+    LOG("  context around fptr at %p:", (void *)fptr_loc);
+    for (int off = -32; off <= 64; off += 8) {
+        uintptr_t addr = fptr_loc + off;
+        uintptr_t val = *(volatile uintptr_t *)addr;
+        const char *tag = "";
+        if (val >= m->text_start && val < m->text_end) tag = " [.text]";
+        else if (val >= m->base && val < m->ro_end) tag = " [MPC]";
+        LOG("    [%+d] %p = %p%s", off, (void *)addr, (void *)val, tag);
+    }
+
+    /*
+     * The function pointer is stored in a callback registration node,
+     * not a C++ vtable.  The `this` pointer is likely stored NEAR the
+     * function pointer in the same structure (typical for std::function,
+     * JUCE listeners, signal/slot, etc.).
+     *
+     * Strategy: check each pointer stored near fptr_loc (offsets -64
+     * to +64) to see if it leads to a valid pad-mode controller object
+     * (one whose *(ptr+0x50) is readable and *(*(ptr+0x50)+0x34) is 0–2).
+     */
+
+    /* Build range table with permissions for safe pointer validation. */
+    mf = fopen("/proc/self/maps", "re");
+    if (!mf) return -1;
+
+    #define MAX_RANGES 512
+    struct { uintptr_t lo, hi; int writable; } ranges[MAX_RANGES];
+    int nr = 0;
+    {
+        char line[512];
+        while (fgets(line, sizeof line, mf) && nr < MAX_RANGES) {
+            unsigned long a, b;
+            char perms[8] = {0};
+            if (sscanf(line, "%lx-%lx %4s", &a, &b, perms) < 3) continue;
+            if (perms[0] == 'r')
+                ranges[nr++] = (typeof(ranges[0])){ (uintptr_t)a, (uintptr_t)b,
+                                                     perms[1] == 'w' };
+        }
+    }
+    fclose(mf);
+
+    #define IS_READABLE(addr, sz) ({ \
+        int _ok = 0; uintptr_t _a = (uintptr_t)(addr); \
+        for (int _i = 0; _i < nr; _i++) \
+            if (_a >= ranges[_i].lo && _a + (sz) <= ranges[_i].hi) { _ok = 1; break; } \
+        _ok; })
+
+    #define IS_WRITABLE(addr, sz) ({ \
+        int _ok = 0; uintptr_t _a = (uintptr_t)(addr); \
+        for (int _i = 0; _i < nr; _i++) \
+            if (ranges[_i].writable && \
+                _a >= ranges[_i].lo && _a + (sz) <= ranges[_i].hi) { _ok = 1; break; } \
+        _ok; })
+
+    /* Check pointers stored near the function pointer location. */
+    for (int off = -64; off <= 64; off += 8) {
+        if (off == 0) continue; /* skip the function pointer itself */
+        uintptr_t neighbor = fptr_loc + off;
+        if (!IS_READABLE(neighbor, 8)) continue;
+
+        uintptr_t candidate = *(volatile uintptr_t *)neighbor;
+        if (!candidate || !IS_READABLE(candidate, 0x58)) continue;
+
+        /* Check the inner-object indirection: *(candidate+0x50) → inner.
+         * Both candidate and inner must be in WRITABLE pages (heap/bss).
+         * Extra checks, from the firmware's code:
+         *   this+0x48 → different valid writable pointer
+         *   inner+0x34 → mode 0-2
+         *   inner+0x18 → valid writable pointer (set_mode target)
+         *   this+0x68 → valid readable pointer (notification target) */
+        if (!IS_WRITABLE(candidate, 0x70)) continue;
+
+        uintptr_t inner = *(volatile uintptr_t *)(candidate + 0x50);
+        if (!inner || !IS_WRITABLE(inner, 0x2A4)) continue;
+
+        uintptr_t other = *(volatile uintptr_t *)(candidate + 0x48);
+        if (!other || other == inner || !IS_WRITABLE(other, 8)) continue;
+
+        int32_t mode_val = *(volatile int32_t *)(inner + 0x34);
+        if (mode_val < 0 || mode_val > 2) continue;
+
+        uintptr_t set_tgt = *(volatile uintptr_t *)(inner + 0x18);
+        if (!set_tgt || !IS_WRITABLE(set_tgt, 8)) continue;
+
+        uintptr_t notify_ptr = *(volatile uintptr_t *)(candidate + 0x68);
+        if (!notify_ptr || !IS_READABLE(notify_ptr, 8)) continue;
+
+        LOG("  neighbor [%+d] = %p → inner=%p mode=%d (rw-validated)",
+            off, (void *)candidate, (void *)inner, mode_val);
+        g_this_direct = (void *)candidate;
+        return 0;
+    }
+
+    /* Fallback: scan rw segments via /proc/self/mem in large blocks
+     * (safe reads — returns errors instead of SIGSEGV on unmapped pages). */
+    LOG("  no neighbor match — scanning rw segments via /proc/self/mem");
+
+    int memfd = open("/proc/self/mem", O_RDONLY);
+    if (memfd < 0) {
+        LOG("  cannot open /proc/self/mem");
+        goto out;
+    }
+
+    mf = fopen("/proc/self/maps", "re");
+    if (mf) {
+        char line[512];
+        int candidates = 0;
+        uintptr_t found_this[8];
+        uintptr_t found_inner[8];
+        int32_t found_mode[8];
+        /* 64KB block buffer — read large chunks, scan locally */
+        enum { BLK = 65536 };
+        uintptr_t *blk = malloc(BLK);
+        if (!blk) { fclose(mf); close(memfd); goto out; }
+
+        while (fgets(line, sizeof line, mf)) {
+            unsigned long a, b;
+            char perms[8] = {0};
+            if (sscanf(line, "%lx-%lx %4s", &a, &b, perms) < 3) continue;
+            if (perms[0] != 'r' || perms[1] != 'w') continue;
+            if ((b - a) > (256UL << 20)) continue;
+            if (strstr(line, "[stack") || strstr(line, ".so")) continue;
+
+            for (uintptr_t base = (uintptr_t)a; base < (uintptr_t)b; base += BLK) {
+                size_t chunk = (uintptr_t)b - base;
+                if (chunk > BLK) chunk = BLK;
+                ssize_t got = pread(memfd, blk, chunk, base);
+                if (got < (ssize_t)(0x70)) continue;
+                size_t words = got / 8;
+
+                for (size_t i = 0; i + 0x68/8 < words; i++) {
+                    uintptr_t inner = blk[i + 0x50/8];
+                    if (!inner || !IS_WRITABLE(inner, 0x2A4)) continue;
+
+                    /* this+0x48 must be a different valid writable pointer */
+                    uintptr_t other = blk[i + 0x48/8];
+                    if (!other || other == inner || !IS_WRITABLE(other, 8)) continue;
+
+                    int32_t mode_val;
+                    if (pread(memfd, &mode_val, 4, inner + 0x34) != 4) continue;
+                    if (mode_val < 0 || mode_val > 2) continue;
+
+                    /* inner+0x18 must be a valid writable pointer (set_mode target) */
+                    uintptr_t set_tgt;
+                    if (pread(memfd, &set_tgt, 8, inner + 0x18) != 8) continue;
+                    if (!set_tgt || !IS_WRITABLE(set_tgt, 8)) continue;
+
+                    uintptr_t notify = blk[i + 0x68/8];
+                    if (!notify || !IS_READABLE(notify, 8)) continue;
+
+                    uintptr_t p = base + i * 8;
+                    if (candidates < 8) {
+                        found_this[candidates] = p;
+                        found_inner[candidates] = inner;
+                        found_mode[candidates] = mode_val;
+                    }
+                    candidates++;
+                    if (candidates <= 8)
+                        LOG("  rw-scan candidate this=%p inner=%p mode=%d "
+                            "other=%p set_tgt=%p notify=%p",
+                            (void *)p, (void *)inner, mode_val,
+                            (void *)other, (void *)set_tgt, (void *)notify);
+                }
+            }
+        }
+        free(blk);
+        fclose(mf);
+        close(memfd);
+        memfd = -1;
+        LOG("  rw-scan found %d candidates", candidates);
+
+        if (candidates == 1) {
+            LOG("  rw-scan resolved this=%p inner=%p",
+                (void *)found_this[0], (void *)found_inner[0]);
+            g_this_direct = (void *)found_this[0];
+            return 0;
+        }
+
+        /* If exactly one candidate has mode != 0, that's likely the real
+         * controller (other objects have 0 by coincidence).  Especially
+         * after the PadPerform bool patch, the controller may init to mode 1. */
+        int nonzero_count = 0;
+        int nonzero_idx = -1;
+        int top = candidates < 8 ? candidates : 8;
+        for (int i = 0; i < top; i++) {
+            if (found_mode[i] != 0) { nonzero_count++; nonzero_idx = i; }
+        }
+        if (nonzero_count == 1 && nonzero_idx >= 0) {
+            LOG("  rw-scan: unique non-zero mode candidate this=%p inner=%p mode=%d",
+                (void *)found_this[nonzero_idx], (void *)found_inner[nonzero_idx],
+                found_mode[nonzero_idx]);
+            g_this_direct = (void *)found_this[nonzero_idx];
+            return 0;
+        }
+        goto out;
+    }
+    if (memfd >= 0) close(memfd);
+
+out:
+
+    LOG("  could not find this pointer");
+    #undef IS_READABLE
+    #undef IS_WRITABLE
+    #undef MAX_RANGES
     return -1;
 }
 
 #define SOCK_PATH "/tmp/padmode.sock"
 
-typedef void (*cycle_fn_t)(void *self);
+static sigjmp_buf s_call_jmpbuf;
+static volatile sig_atomic_t s_in_unsafe_call;
+
+static void unsafe_call_segv(int sig, siginfo_t *si, void *ctx)
+{
+    (void)ctx;
+    if (s_in_unsafe_call) {
+        LOG("SEGV in call — si_addr=%p", si ? si->si_addr : NULL);
+        siglongjmp(s_call_jmpbuf, sig);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static int read_mode(void *self)
+{
+    uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+    return inner ? *(volatile int32_t *)(inner + 0x34) : -1;
+}
+
+static const char *mode_name(int m)
+{
+    static const char *names[] = {"Full Level", "Pad Perform", "16 Level"};
+    return (m >= 0 && m <= 2) ? names[m] : "?";
+}
+
+static void find_set_mode_func(void)
+{
+    if (!g_cycle_func || g_set_mode_func) return;
+    /* The cycling function's mode==0 handler at +0x78 is:
+     *   ADD X0, X20, #24      ; inner+0x18
+     *   MOV W1, #2
+     *   STR X21, [SP, #64]
+     *   BL  set_mode           ; at +0x84
+     * Decode the BL at cycle_func + 0x84. */
+    uint32_t bl = *(volatile uint32_t *)(g_cycle_func + 0x84);
+    if ((bl >> 26) != 0x25) {
+        LOG("  expected BL at cycle+0x84, got %08x", bl);
+        return;
+    }
+    int32_t imm = (int32_t)(bl << 6) >> 4;
+    g_set_mode_func = (g_cycle_func + 0x84) + imm;
+    LOG("  set_mode at %p (decoded from cycle+0x84)", (void *)g_set_mode_func);
+}
 
 static void *socket_worker(void *arg)
 {
     (void)arg;
-    sigset_t all;
-    sigfillset(&all);
-    pthread_sigmask(SIG_SETMASK, &all, NULL);
+    /* Unmask synchronous fault signals so our handler can recover */
+    sigset_t mask;
+    sigfillset(&mask);
+    sigdelset(&mask, SIGSEGV);
+    sigdelset(&mask, SIGBUS);
+    pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
+    struct sigaction sa = {0}, old_segv, old_bus;
+    sa.sa_sigaction = unsafe_call_segv;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS,  &sa, &old_bus);
+
+    find_set_mode_func();
 
     unlink(SOCK_PATH);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -630,43 +1106,201 @@ static void *socket_worker(void *arg)
     LOG("listening on %s", SOCK_PATH);
 
     for (;;) {
-        int c = accept(fd, NULL, NULL);
+        int volatile c = accept(fd, NULL, NULL);
         if (c < 0) continue;
 
         char buf[64] = {0};
         ssize_t n = read(c, buf, sizeof buf - 1);
         buf[n > 0 ? n : 0] = 0;
-        /* strip newline */
         char *nl = strchr(buf, '\n');
         if (nl) *nl = 0;
 
-        if (!strcmp(buf, "cycle")) {
+        if (!strcmp(buf, "cycle") || !strncmp(buf, "setmode ", 8)) {
+            int is_cycle = !strcmp(buf, "cycle");
             void *self = resolve_this_ptr();
-            if (self && g_cycle_func) {
-                LOG("calling cycle at %p this=%p", (void *)g_cycle_func, self);
-                ((cycle_fn_t)g_cycle_func)(self);
-                int32_t mode = *(volatile int32_t *)((uintptr_t)self + 0x34);
-                const char *names[] = {"Full Level", "Pad Perform", "16 Level"};
-                const char *name = (mode >= 0 && mode <= 2) ? names[mode] : "?";
-                char reply[64];
-                int rlen = snprintf(reply, sizeof reply, "mode=%d (%s)\n", mode, name);
-                write(c, reply, rlen);
-                LOG("mode after cycle: %d (%s)", mode, name);
-            } else {
-                const char *msg = "no this pointer\n";
+            if (!self || !g_set_mode_func || !g_main_thread) {
+                const char *msg = "not ready\n";
                 write(c, msg, strlen(msg));
+            } else {
+                int cur = read_mode(self);
+                int target;
+                if (is_cycle) {
+                    static const int next_mode[] = { 2, 0, 1 };
+                    target = (cur >= 0 && cur <= 2) ? next_mode[cur] : 0;
+                } else {
+                    target = atoi(buf + 8);
+                    if (target < 0 || target > 2) {
+                        const char *msg = "mode must be 0-2\n";
+                        write(c, msg, strlen(msg));
+                        close(c);
+                        continue;
+                    }
+                }
+
+                g_setmode_result = -99;
+                g_direct_target = target;
+                g_pending_setmode = 0;
+                __sync_synchronize();
+
+                for (int w = 0; w < 100 && g_setmode_result == -99; w++)
+                    usleep(10000);
+
+                int mode = read_mode(self);
+                char reply[128];
+                int rlen;
+                if (g_setmode_result == -99) {
+                    rlen = snprintf(reply, sizeof reply,
+                        "timeout — mode=%d (%s)\n", mode, mode_name(mode));
+                } else if (g_setmode_result >= 100) {
+                    rlen = snprintf(reply, sizeof reply,
+                        "crashed, mode=%d (%s)\n", mode, mode_name(mode));
+                } else {
+                    rlen = snprintf(reply, sizeof reply,
+                        "mode=%d (%s)\n", mode, mode_name(mode));
+                }
+                LOG("%s %d→%d (%s)%s",
+                    is_cycle ? "cycle" : "setmode",
+                    cur, mode, mode_name(mode),
+                    g_setmode_result >= 100 ? " [crashed]" : "");
+                write(c, reply, rlen);
             }
+
+        } else if (!strncmp(buf, "directmode ", 11)) {
+            int target = atoi(buf + 11);
+            if (target < 0 || target > 2) {
+                const char *msg = "mode must be 0-2\n";
+                write(c, msg, strlen(msg));
+            } else if (!resolve_this_ptr() || !g_set_mode_func || !g_main_thread) {
+                char reply[128];
+                int rlen = snprintf(reply, sizeof reply,
+                    "not ready: self=%p set_mode=%p main_tid=%lu\n",
+                    resolve_this_ptr(), (void *)g_set_mode_func,
+                    (unsigned long)g_main_thread);
+                write(c, reply, rlen);
+            } else {
+                void *self = resolve_this_ptr();
+                int cur = read_mode(self);
+                g_setmode_result = -99;
+                g_direct_target = target;
+                g_pending_setmode = 0;
+                __sync_synchronize();
+
+                for (int w = 0; w < 100 && g_setmode_result == -99; w++)
+                    usleep(10000);
+
+                int mode = read_mode(self);
+                char reply[128];
+                int rlen;
+                if (g_setmode_result == -99) {
+                    rlen = snprintf(reply, sizeof reply,
+                        "timeout — poll hook not firing? mode=%d (%s)\n",
+                        mode, mode_name(mode));
+                } else if (g_setmode_result >= 100) {
+                    rlen = snprintf(reply, sizeof reply,
+                        "set_mode crashed, mode=%d (%s) [was %d]\n",
+                        mode, mode_name(mode), cur);
+                } else {
+                    rlen = snprintf(reply, sizeof reply,
+                        "mode=%d (%s)\n", mode, mode_name(mode));
+                }
+                LOG("directmode %d: %d→%d (%s)%s", target, cur, mode,
+                    mode_name(mode),
+                    g_setmode_result >= 100 ? " [crashed]" : "");
+                write(c, reply, rlen);
+            }
+
+        } else if (!strncmp(buf, "writemode ", 10)) {
+            int target = atoi(buf + 10);
+            if (target < 0 || target > 2) {
+                const char *msg = "mode must be 0-2\n";
+                write(c, msg, strlen(msg));
+            } else {
+                void *self = resolve_this_ptr();
+                if (!self) {
+                    const char *msg = "no this pointer\n";
+                    write(c, msg, strlen(msg));
+                } else {
+                    uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+                    if (!inner) {
+                        const char *msg = "inner pointer is null\n";
+                        write(c, msg, strlen(msg));
+                    } else {
+                        volatile int32_t *mp = (volatile int32_t *)(inner + 0x34);
+                        s_in_unsafe_call = 1;
+                        int crashed = sigsetjmp(s_call_jmpbuf, 1);
+                        if (!crashed) {
+                            int old = *mp;
+                            *mp = target;
+                            int now = *mp;
+                            s_in_unsafe_call = 0;
+                            char reply[96];
+                            int rlen = snprintf(reply, sizeof reply,
+                                "wrote mode %d→%d (read back %d) at %p\n",
+                                old, target, now, (void *)mp);
+                            write(c, reply, rlen);
+                            LOG("writemode %d→%d at %p", old, target, (void *)mp);
+                        } else {
+                            s_in_unsafe_call = 0;
+                            char reply[96];
+                            int rlen = snprintf(reply, sizeof reply,
+                                "CRASHED writing to %p (signal %d)\n",
+                                (void *)mp, crashed);
+                            write(c, reply, rlen);
+                            LOG("writemode crashed at %p", (void *)mp);
+                        }
+                    }
+                }
+            }
+
+        } else if (!strcmp(buf, "perms")) {
+            void *self = resolve_this_ptr();
+            char reply[512];
+            int rlen = 0;
+            if (!self) {
+                rlen = snprintf(reply, sizeof reply, "no this pointer\n");
+            } else {
+                uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+                uintptr_t mode_addr = inner + 0x34;
+                FILE *maps = fopen("/proc/self/maps", "r");
+                if (!maps) {
+                    rlen = snprintf(reply, sizeof reply, "can't read maps\n");
+                } else {
+                    char line[256];
+                    int found = 0;
+                    while (fgets(line, sizeof line, maps)) {
+                        unsigned long lo, hi;
+                        char perms[8];
+                        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) == 3) {
+                            if (mode_addr >= lo && mode_addr < hi) {
+                                rlen = snprintf(reply, sizeof reply,
+                                    "mode@%p in %lx-%lx %s\nthis@%p inner@%p\n",
+                                    (void *)mode_addr, lo, hi, perms,
+                                    self, (void *)inner);
+                                found = 1;
+                                break;
+                            }
+                        }
+                    }
+                    fclose(maps);
+                    if (!found)
+                        rlen = snprintf(reply, sizeof reply,
+                            "mode@%p not found in maps!\n", (void *)mode_addr);
+                }
+            }
+            write(c, reply, rlen);
+
         } else if (!strcmp(buf, "status")) {
             void *self = resolve_this_ptr();
-            char reply[128];
+            char reply[192];
             int rlen;
             if (self) {
-                int32_t mode = *(volatile int32_t *)((uintptr_t)self + 0x34);
-                const char *names[] = {"Full Level", "Pad Perform", "16 Level"};
-                const char *name = (mode >= 0 && mode <= 2) ? names[mode] : "?";
+                uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+                int mode = inner ? *(volatile int32_t *)(inner + 0x34) : -1;
                 rlen = snprintf(reply, sizeof reply,
-                    "func=%p this=%p mode=%d (%s)\n",
-                    (void *)g_cycle_func, self, mode, name);
+                    "func=%p set_mode=%p this=%p inner=%p mode=%d (%s) main_tid=%lu\n",
+                    (void *)g_cycle_func, (void *)g_set_mode_func,
+                    self, (void *)inner, mode, mode_name(mode),
+                    (unsigned long)g_main_thread);
             } else {
                 rlen = snprintf(reply, sizeof reply, "no this pointer\n");
             }
@@ -722,8 +1356,26 @@ static void *worker(void *arg)
     uintptr_t cycle = find_cycle_func(&m);
     if (cycle) {
         g_cycle_func = cycle;
-        find_this_pointer(&m, cycle);
+        if (find_this_pointer(&m, cycle) != 0) {
+            /* The object might not be constructed yet.  Retry at
+             * increasing intervals: the MPC takes several seconds to
+             * finish initialising its control-surface objects. */
+            static const unsigned delays_ms[] = { 5000, 10000, 20000 };
+            for (unsigned i = 0; i < sizeof delays_ms / sizeof *delays_ms; i++) {
+                if (resolve_this_ptr()) break;
+                LOG("retrying this-pointer scan in %u ms", delays_ms[i]);
+                usleep(delays_ms[i] * 1000u);
+                m = find_mpc();
+                if (m.base && m.text_start)
+                    find_this_pointer(&m, cycle);
+            }
+        }
     }
+
+    if (resolve_this_ptr())
+        LOG("this pointer resolved — socket cycle command ready");
+    else if (g_cycle_func)
+        LOG("this pointer NOT found — cycle command unavailable, try MIDI injection");
 
     /* Start socket listener if we have at least the function address. */
     if (g_cycle_func) {
@@ -747,6 +1399,8 @@ __attribute__((constructor)) static void addin_init(void)
     }
 
     LOG("starting");
+
+    g_main_thread = pthread_self();
 
     if (getenv("MPC_ENABLE_SCALEMODE_SYNC")) {
         /* Test mode: run synchronously in the constructor, before main().
