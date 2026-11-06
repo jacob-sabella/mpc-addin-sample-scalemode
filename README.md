@@ -39,7 +39,7 @@ make deploy MPC_HOST=root@<device-ip>
 enabled=1          # 0 to load but skip all patches
 scale=Blues        # Chromatic, Major, Minor, Harm Minor, Dorian, Blues, Phrygian, Mixolydian
 root=C3            # note name with octave, or MIDI number (0-127)
-octave_offset=0    # shift all notes up/down (-4 to 4)
+octave_offset=2    # shift all notes up/down (-4 to 4); 2 centers bank A at root
 ```
 
 Settings are read on each MPC startup. Changes via `padctl` are saved
@@ -69,6 +69,10 @@ padctl hookhits     # how many times the hook has fired
   built-in Pad Perform settings dialogue. Use `padctl` over SSH or edit the
   conf file for settings. The pad mode indicator (Full Level / 16 Level /
   Pad Perform) is handled natively by the firmware.
+- **No mode cycling button.** The Sample has no physical 16 Level / Full
+  Level button. The addin starts in Pad Perform mode and `padctl cycle`
+  over SSH is the only way to switch between Full Level, 16 Level and
+  Pad Perform.
 - **Hook requires physical pad press.** The note mapping function is only
   called from the analog pad hardware handler (UART serial path). MIDI
   injection via ALSA or the kernel module does not reach it.
