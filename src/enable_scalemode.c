@@ -38,9 +38,10 @@
 struct conf {
     int enabled;
     int padperform_patch; /* force the PadPerform "supported" bool (blocks 16 Levels) */
+    int scale_slot;       /* native 16 Levels Type value that Scale follows in the cycle */
 };
 
-static struct conf C = { .enabled = 1, .padperform_patch = 0 };
+static struct conf C = { .enabled = 1, .padperform_patch = 0, .scale_slot = 1 };
 
 static void addin_dir(char *out, size_t n)
 {
@@ -81,6 +82,7 @@ static void load_conf(void)
         val[strcspn(val, "\n\r")] = 0;
         if (!strcmp(line, "enabled")) C.enabled = atoi(val);
         else if (!strcmp(line, "padperform_patch")) C.padperform_patch = atoi(val);
+        else if (!strcmp(line, "scale_slot")) C.scale_slot = atoi(val);
     }
     fclose(f);
 }
@@ -686,15 +688,52 @@ static void save_conf(void)
     rename(tmp, path);
 }
 
+static volatile int g_scale_on;   /* Scale selected as the 16 Levels Type */
+static void *volatile g_type_ctl; /* Type controller, captured from the firmware's cycle call */
+
+static int current_type(void)
+{
+    void *self = g_type_ctl;
+    if (!self) return -1;
+    uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+    return inner ? *(volatile int32_t *)(inner + 0x34) : -1;
+}
+
+/* Shift+16 Levels. Returning 1 skips the native advance, so Scale sits after
+ * Type value C.scale_slot with that native Type left in place underneath. */
+static int type_cycle_hook(void *self)
+{
+    g_type_ctl = self;
+    int cur = current_type();
+    if (g_scale_on) {
+        g_scale_on = 0;
+        LOG("type-cycle: Scale -> native advance from type %d", cur);
+        return 0;
+    }
+    if (cur == C.scale_slot) {
+        g_scale_on = 1;
+        LOG("type-cycle: type %d -> Scale", cur);
+        return 1;
+    }
+    LOG("type-cycle: native advance from type %d", cur);
+    return 0;
+}
+
+static int sixteen_button_hook(void *self)
+{
+    LOG("16-levels-button: this=%p type=%d scale_on=%d", self, current_type(), g_scale_on);
+    return 0;
+}
+
 static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
 {
-    int mode = *(volatile int *)((uintptr_t)ctx + 0x88);
+    (void)ctx;
     int hits = __sync_add_and_fetch(&g_hook_hits, 1);
     if (hits <= 16 || (hits & 0xFF) == 0)
-        LOG("hook[%d]: mode=%d pad_val=0x%lx ctx=%p pad_ctx=%p",
-            hits, mode, (unsigned long)pad_val, ctx, pad_ctx);
+        LOG("hook[%d]: type=%d scale_on=%d pad_val=0x%lx",
+            hits, current_type(), g_scale_on, (unsigned long)pad_val);
 
-    if (mode != 1) return 0;
+    if (!g_scale_on) return 0;
 
     int pad = (int)(pad_val & 0xF);
     int sc  = g_scale_type;
@@ -803,6 +842,9 @@ static int install_paciasp_hook(uintptr_t target, void *callback, const char *na
     return 0;
 }
 
+#define TYPE_CYCLE_OFFSET     0x1542030
+#define SIXTEEN_BUTTON_OFFSET 0x1542260
+
 static int install_scale_hook(struct mpc_mapping *m)
 {
     uintptr_t note_map = m->base + NOTE_MAP_OFFSET;
@@ -824,7 +866,12 @@ static int install_scale_hook(struct mpc_mapping *m)
     g_note_setter = (note_setter_fn_t)note_set;
     LOG("note-setter at %p", (void *)note_set);
 
-    return install_paciasp_hook(note_map, (void *)scale_map_hook, "scale_map");
+    if (install_paciasp_hook(note_map, (void *)scale_map_hook, "scale_map") != 0)
+        return -1;
+    if (install_paciasp_hook(m->base + TYPE_CYCLE_OFFSET, (void *)type_cycle_hook, "type_cycle") != 0)
+        LOG("type-cycle hook failed — Scale is reachable only through padctl");
+    install_paciasp_hook(m->base + SIXTEEN_BUTTON_OFFSET, (void *)sixteen_button_hook, "16_levels_button");
+    return 0;
 }
 
 /* ── pad-mode cycling trigger ── */
@@ -856,6 +903,7 @@ static volatile int g_direct_target = -1;   /* >= 0: call set_mode directly inst
 
 static void *resolve_this_ptr(void)
 {
+    if (g_type_ctl) return g_type_ctl;
     if (g_this_direct) return g_this_direct;
     if (g_this_global) return *(void *volatile *)g_this_global;
     return NULL;
@@ -1303,7 +1351,7 @@ static int read_mode(void *self)
 
 static const char *mode_name(int m)
 {
-    static const char *names[] = {"Full Level", "Pad Perform", "16 Level"};
+    static const char *names[] = {"type 0", "type 1", "type 2"}; /* 16 Levels Type; names not mapped yet */
     return (m >= 0 && m <= 2) ? names[m] : "?";
 }
 
@@ -1638,10 +1686,11 @@ static void *socket_worker(void *arg)
                 uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
                 int mode = inner ? *(volatile int32_t *)(inner + 0x34) : -1;
                 rlen = snprintf(reply, sizeof reply,
-                    "func=%p set_mode=%p this=%p inner=%p mode=%d (%s) "
+                    "func=%p set_mode=%p this=%p%s inner=%p type=%d scale_on=%d "
                     "scale=%s root=%d oct=%d setter=%p main_tid=%lu\n",
                     (void *)g_cycle_func, (void *)g_set_mode_func,
-                    self, (void *)inner, mode, mode_name(mode),
+                    self, g_type_ctl ? " (from firmware)" : " (scanned)",
+                    (void *)inner, mode, g_scale_on,
                     (g_scale_type >= 0 && g_scale_type < NUM_SCALES)
                         ? scale_names[g_scale_type] : "?",
                     g_root_note, g_octave_offset,
@@ -1701,7 +1750,7 @@ static void *worker(void *arg)
     load_scale_conf();
 
     if (install_scale_hook(&m) == 0)
-        LOG("scale-map hook active — pads remap in Pad Perform mode");
+        LOG("scale-map hook active — pads remap when Scale is the 16 Levels Type");
     else
         LOG("scale-map hook failed — note remapping unavailable");
 
