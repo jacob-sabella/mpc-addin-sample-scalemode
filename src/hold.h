@@ -52,7 +52,6 @@ static int hold_is_surface(int fd)
     if (n <= 0) return 0;
     t[n] = 0;
     g_hold_cls[fd] = strstr(t, "/dev/snd/midiC0D0") ? 1 : 2;
-    if (g_hold_cls[fd] == 1) g_surface_fd = fd;
     return g_hold_cls[fd] == 1;
 }
 
@@ -106,6 +105,7 @@ __attribute__((visibility("default"))) ssize_t read(int fd, void *buf, size_t n)
     static ssize_t (*real_read)(int, void *, size_t);
     if (!real_read) real_read = (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read");
     if (!g_hold_on || n == 0 || !hold_is_surface(fd)) return real_read(fd, buf, n);
+    g_surface_fd = fd;   /* the fd MPC reads: injected frames go to it */
     for (;;) {
         pthread_mutex_lock(&g_hold_mu);
         if (g_hold_npend && g_hold_pend_fd == fd) {   /* the held-back release, a read of its own */
@@ -141,6 +141,40 @@ __attribute__((visibility("default"))) int close(int fd)
     if (!real_close) real_close = (int (*)(int))dlsym(RTLD_NEXT, "close");
     if (fd >= 0 && fd < HOLD_MAXFD) g_hold_cls[fd] = 0;
     return real_close(fd);
+}
+
+/* MPC's writes to the control surface are its lights: CC on channel 1, the button's note and its state (seen on the
+ * Sample, 2026-11-06: b0 28 02 lights 16 Levels; pad colours go out as sysex). padctl leds lists
+ * the lit ones, which shows the transport state (Rec, Play) without looking at the device. */
+static unsigned char g_led[128];
+static unsigned char g_wr[96]; static unsigned g_wr_n, g_wr_calls;   /* the last bytes MPC wrote to the surface */
+
+__attribute__((visibility("default"))) ssize_t write(int fd, const void *buf, size_t n)
+{
+    static ssize_t (*real_write)(int, const void *, size_t);
+    if (!real_write) real_write = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
+    if (g_hold_on && n >= 3 && fd >= 0 && fd < HOLD_MAXFD && g_hold_cls[fd] != 2) {
+        if (hold_is_surface(fd)) {
+            const unsigned char *b = buf;
+            g_wr_calls++;
+            for (size_t i = 0; i < n; i++) g_wr[g_wr_n++ % sizeof g_wr] = b[i];
+            for (size_t i = 0; i + 2 < n; i++)
+                if (b[i] == 0xB0 && b[i + 1] < 128) { g_led[b[i + 1]] = b[i + 2]; i += 2; }   /* light: button, state */
+        }
+    }
+    return real_write(fd, buf, n);
+}
+
+static int hold_leds(char *out, size_t cap)
+{
+    size_t o = 0;
+    for (int i = 0; i < 128 && o + 12 < cap; i++)
+        if (g_led[i]) o += (size_t)snprintf(out + o, cap - o, "%d=%d ", i, g_led[i]);
+    o += (size_t)snprintf(out + o, cap - o, "\nwrites=%u last:", g_wr_calls);
+    unsigned k = g_wr_n < sizeof g_wr ? 0 : g_wr_n - (unsigned)sizeof g_wr;
+    for (; k < g_wr_n && o + 4 < cap; k++) o += (size_t)snprintf(out + o, cap - o, " %02x", g_wr[k % sizeof g_wr]);
+    if (o + 2 < cap) { out[o++] = '\n'; out[o] = 0; }
+    return (int)o;
 }
 
 static int hold_pending(void)

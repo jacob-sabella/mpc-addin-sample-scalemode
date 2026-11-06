@@ -72,6 +72,17 @@ int main(void)
     struct pollfd pf = { 7, POLLIN, 0 };
     CHECK(hold_watches(&pf, 1) && hold_mark(&pf, 1, 0) == 1 && (pf.revents & POLLIN));
     (void)hold_start;
+    /* LED writes: lit notes listed */
+    {
+        int pfd[2]; CHECK(pipe(pfd) == 0);
+        g_hold_on = 1; g_hold_cls[pfd[1]] = 1;   /* as if it were the surface */
+        unsigned char led[6] = { 0xB0, 73, 3, 0xB0, 82, 0 };
+        CHECK(write(pfd[1], led, sizeof led) == 6);
+        char o[200]; hold_leds(o, sizeof o);
+        CHECK(!strncmp(o, "73=3 \nwrites=1 last: b0 49 03 b0 52 00", 38));
+        g_hold_cls[pfd[1]] = 0; close(pfd[0]); close(pfd[1]);
+    }
+
     printf(fails ? "hold_test: %d failed\n" : "hold_test: ok\n", fails);
     return fails != 0;
 }

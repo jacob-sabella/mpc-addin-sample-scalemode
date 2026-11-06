@@ -1719,6 +1719,11 @@ static void *socket_worker(void *arg)
             else
                 snprintf(reply, sizeof reply, "%s ch%d %d\n", on ? "on" : "off", ch, nt);
             write(c, reply, strlen(reply));
+        } else if (!strcmp(buf, "leds")) {
+            char reply[600];
+            int rlen = hold_leds(reply, sizeof reply);
+            write(c, reply, rlen);
+
         } else if (!strcmp(buf, "page")) {
             page_popup();
             const char *r = g_pg ? "page: opening\n" : "page: no SCALE page (draw handler missing?)\n";
