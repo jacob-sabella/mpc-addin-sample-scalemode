@@ -37,9 +37,10 @@
 
 struct conf {
     int enabled;
+    int padperform_patch; /* force the PadPerform "supported" bool (blocks 16 Levels) */
 };
 
-static struct conf C = { .enabled = 1 };
+static struct conf C = { .enabled = 1, .padperform_patch = 0 };
 
 static void addin_dir(char *out, size_t n)
 {
@@ -79,6 +80,7 @@ static void load_conf(void)
         char *val = eq;
         val[strcspn(val, "\n\r")] = 0;
         if (!strcmp(line, "enabled")) C.enabled = atoi(val);
+        else if (!strcmp(line, "padperform_patch")) C.padperform_patch = atoi(val);
     }
     fclose(f);
 }
@@ -439,7 +441,7 @@ static int try_patch(struct mpc_mapping *m)
      * looking backward for the matching ADD with offset 0xB40 on the
      * same destination register.  The combination is unique.
      */
-    for (uintptr_t pc = m->text_start; pc < m->text_end; pc += 4) {
+    for (uintptr_t pc = m->text_start; C.padperform_patch && pc < m->text_end; pc += 4) {
         uint32_t w = insn_at(pc);
         if ((w & 0xFFFFFC00) != 0x3946C000) continue;
 
