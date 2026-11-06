@@ -1,7 +1,7 @@
 # This addin, for the shared installer in mpc-vst-plugins (tools/release/addin; the keys are in its docs/ADDINS.md).
-ADDIN_ID=enable-scalemode
-ADDIN_NAME="Enable Scale Mode"
-ADDIN_SO=mpc_enable_scalemode.so
-ADDIN_CONF=mpc_enable_scalemode.conf
+ADDIN_ID=sample-scalemode
+ADDIN_NAME="MPC Sample Scale Mode"
+ADDIN_SO=mpc_sample_scalemode.so
+ADDIN_CONF=mpc_sample_scalemode.conf
 ADDIN_FILES="padctl"
 ADDIN_DONE="Hold 16 Levels (about a second) to turn Scale on or off; the SCALE page shows the notes, the soft keys pick scale/root/octave and the dial changes it. Needs the MPC Sample draw handler addin for the page."

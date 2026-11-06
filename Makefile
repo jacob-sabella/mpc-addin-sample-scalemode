@@ -1,7 +1,7 @@
 .PHONY: build clean release deploy
 
 VERSION := $(shell cat VERSION)
-REPO    := jacob-sabella/mpc-addin-enable-scalemode
+REPO    := jacob-sabella/mpc-addin-sample-scalemode
 
 build:
 	bash build.sh
@@ -18,5 +18,5 @@ release: build
 
 deploy: build
 	@test -n "$(MPC_HOST)" || { echo "set MPC_HOST (e.g. MPC_HOST=root@192.168.x.x)"; exit 1; }
-	scp build/mpc_enable_scalemode.so build/padctl mpc_enable_scalemode.conf \
-		$(MPC_HOST):/data/mpc-addins/enable-scalemode/
+	scp build/mpc_sample_scalemode.so build/padctl mpc_sample_scalemode.conf \
+		$(MPC_HOST):/data/mpc-addins/sample-scalemode/

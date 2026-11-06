@@ -5,7 +5,7 @@
 #   MPC_HOST=root@<device> [SSH_KEY=~/.ssh/key] tests/device_test.sh [out_dir]
 # AUDIO_SRC=<PulseAudio/PipeWire source of the Sample's USB audio> also records the 16 slots in Blues and checks each one's
 # pitch (tests/pitch_check.py). Load a pitched sample on the 16 Levels pad first (a saw at C3 with a short fade works best;
-# PITCH_MODE=clicks instead for a drum sample with two or more transients).
+# PITCH_MODE=clicks instead for a drum sample with two or more transients)).
 # RESTART=1 also checks that a scale changed on the page survives an MPC restart (restarts MPC once).
 # out_dir (default build/device-test) gets the page frames while pads play, and page.gif when ffmpeg is installed.
 set -euo pipefail
@@ -14,7 +14,7 @@ HOST=${MPC_HOST:?set MPC_HOST=root@<device>}
 SSH=(ssh -o BatchMode=yes ${SSH_KEY:+-i "$SSH_KEY"} "$HOST")
 SCP=(scp -q -o BatchMode=yes ${SSH_KEY:+-i "$SSH_KEY"})
 OUT=${1:-build/device-test}
-P=/data/mpc-addins/enable-scalemode/padctl
+P=/data/mpc-addins/sample-scalemode/padctl
 DH=http://127.0.0.1:6740
 PADS="37 36 42 82"   # bank A's four pads on channel 10
 

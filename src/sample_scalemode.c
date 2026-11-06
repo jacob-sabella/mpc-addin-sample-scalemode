@@ -1,5 +1,5 @@
 /*
- * mpc-addin-enable-scalemode
+ * mpc-addin-sample-scalemode
  *
  * Enables the dark-shipped Pad Perform / Scale Mode on MPC devices where the
  * full infrastructure is compiled in but gated by hardware-type checks.
@@ -31,7 +31,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define LOG(fmt, ...) fprintf(stderr, "enable-scalemode: " fmt "\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) fprintf(stderr, "sample-scalemode: " fmt "\n", ##__VA_ARGS__)
 
 /* ── conf ── */
 
@@ -71,7 +71,7 @@ static void load_conf(void)
     char dir[256], path[512];
     addin_dir(dir, sizeof dir);
     if (!dir[0]) return;
-    snprintf(path, sizeof path, "%s/mpc_enable_scalemode.conf", dir);
+    snprintf(path, sizeof path, "%s/mpc_sample_scalemode.conf", dir);
 
     FILE *f = fopen(path, "re");
     if (!f) return;
@@ -643,7 +643,7 @@ static void load_scale_conf(void)
     char dir[256], path[512];
     addin_dir(dir, sizeof dir);
     if (!dir[0]) return;
-    snprintf(path, sizeof path, "%s/mpc_enable_scalemode.conf", dir);
+    snprintf(path, sizeof path, "%s/mpc_sample_scalemode.conf", dir);
     FILE *f = fopen(path, "re");
     if (!f) return;
     char line[256];
@@ -681,7 +681,7 @@ static void save_conf(void)
     char dir[256], path[512], tmp[520];
     addin_dir(dir, sizeof dir);
     if (!dir[0]) return;
-    snprintf(path, sizeof path, "%s/mpc_enable_scalemode.conf", dir);
+    snprintf(path, sizeof path, "%s/mpc_sample_scalemode.conf", dir);
     snprintf(tmp, sizeof tmp, "%s.new", path);
     static const char *keys[4] = {"scale", "root", "octave_offset", "pad_root"};
     char vals[4][48];
@@ -1792,7 +1792,7 @@ static void *worker(void *arg)
     sigfillset(&all);
     pthread_sigmask(SIG_SETMASK, &all, NULL);
 
-    if (!getenv("MPC_ENABLE_SCALEMODE_SYNC"))
+    if (!getenv("MPC_SAMPLE_SCALEMODE_SYNC"))
         usleep(500000);
 
     struct mpc_mapping m = find_mpc();
@@ -1842,8 +1842,13 @@ static void *worker(void *arg)
 
 __attribute__((constructor)) static void addin_init(void)
 {
-    if (getenv("MPC_ENABLE_SCALEMODE_DISABLE") || !is_mpc_process())
+    if (getenv("MPC_SAMPLE_SCALEMODE_DISABLE") || !is_mpc_process())
         return;
+    const char *pre = getenv("LD_PRELOAD");
+    if (pre && strstr(pre, "mpc_enable_scalemode.so")) {   /* this addin before its rename: both would hook the pads */
+        LOG("off: the old Enable Scale Mode addin is also preloaded; run sh /data/mpc-addins/enable-scalemode/uninstall.sh");
+        return;
+    }
 
     load_conf();
     if (!C.enabled) {
@@ -1855,7 +1860,7 @@ __attribute__((constructor)) static void addin_init(void)
 
     g_main_thread = pthread_self();
 
-    if (getenv("MPC_ENABLE_SCALEMODE_SYNC")) {
+    if (getenv("MPC_SAMPLE_SCALEMODE_SYNC")) {
         /* Test mode: run synchronously in the constructor, before main().
          * Useful under qemu-user where the MPC binary aborts on DRM init
          * before a background thread would wake up. */

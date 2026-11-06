@@ -1,4 +1,4 @@
-/* hold.h: a long hold of 16 Levels toggles Scale (included once, by enable_scalemode.c).
+/* hold.h: a long hold of 16 Levels toggles Scale (included once, by sample_scalemode.c).
  *
  * MPC reads the Sample's buttons from the control-surface rawmidi port (/dev/snd/midiC0D0) in ALSA's timestamped
  * framing: whole 32-byte frames (type, length, 2 reserved, timestamps, then up to 16 MIDI bytes at offset 16), one

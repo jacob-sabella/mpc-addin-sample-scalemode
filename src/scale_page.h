@@ -1,5 +1,5 @@
 /* scale_page.h: the SCALE page on the MPC Sample's screen, through mpc-addin-sample-draw-handler (included once, by
- * enable_scalemode.c, after the scale state it shows).
+ * sample_scalemode.c, after the scale state it shows).
  *
  * It opens by itself when a long hold of 16 Levels toggles Scale, or with `padctl page`, and stays while Scale is on; a dial
  * press closes it (holding 16 Levels twice, Scale off and on, brings it back), and with Scale off it closes after PAGE_IDLE_MS without

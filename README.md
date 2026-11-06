@@ -1,4 +1,4 @@
-# Enable Scale Mode
+# MPC Sample Scale Mode
 
 An addin for the MPC Sample: **hold 16 Levels** to play its 16 slots in a scale,
 with a **SCALE page** on the screen to pick the scale, root and octave.
@@ -45,9 +45,14 @@ make release       # package the dist zip
 make deploy MPC_HOST=root@<device-ip>
 ```
 
+Before 0.3.0 this addin was called Enable Scale Mode (`mpc-addin-enable-scalemode`,
+folder `/data/mpc-addins/enable-scalemode`). If you installed it, uninstall it first:
+`sh /data/mpc-addins/enable-scalemode/uninstall.sh`. While the old one is still loaded,
+this one stays off and says so in MPC's log.
+
 ## Settings
 
-`mpc_enable_scalemode.conf` next to the `.so`:
+`mpc_sample_scalemode.conf` next to the `.so`:
 
 ```
 enabled=1          # 0 to load but do nothing
