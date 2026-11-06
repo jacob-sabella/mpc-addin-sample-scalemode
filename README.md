@@ -7,6 +7,8 @@ On the Sample, 16 Levels spreads one sound over 16 slots (4 pads x 4 banks) and
 Shift+16 Levels cycles its Type (Tune, Velocity, Filter). With Scale on, the slots
 play the notes of a scale instead of those steps.
 
+![The SCALE page on an MPC Sample: E Blues, the slot being played lit](docs/screenshots/scale-page.png)
+
 ## Use
 
 1. Put a melodic sample on a pad and press **16 Levels** to turn it on.
