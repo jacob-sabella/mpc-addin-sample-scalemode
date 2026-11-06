@@ -675,6 +675,7 @@ static void load_scale_conf(void)
         scale_names[g_scale_type], g_root_note, g_pad_root, g_octave_offset);
 }
 
+/* Rewrites the four keys the page and padctl change, in place; every other line (comments, hold_ms, page...) is kept. */
 static void save_conf(void)
 {
     char dir[256], path[512], tmp[520];
@@ -682,12 +683,28 @@ static void save_conf(void)
     if (!dir[0]) return;
     snprintf(path, sizeof path, "%s/mpc_enable_scalemode.conf", dir);
     snprintf(tmp, sizeof tmp, "%s.new", path);
-    FILE *f = fopen(tmp, "we");
-    if (!f) return;
-    fprintf(f, "enabled=1\nscale=%s\nroot=%d\noctave_offset=%d\n",
-            scale_names[g_scale_type], g_root_note, g_octave_offset);
-    if (g_pad_root != 60)
-        fprintf(f, "pad_root=%d\n", g_pad_root);
+    static const char *keys[4] = {"scale", "root", "octave_offset", "pad_root"};
+    char vals[4][48];
+    snprintf(vals[0], sizeof vals[0], "%s", scale_names[g_scale_type]);
+    snprintf(vals[1], sizeof vals[1], "%d", g_root_note);
+    snprintf(vals[2], sizeof vals[2], "%d", g_octave_offset);
+    snprintf(vals[3], sizeof vals[3], "%d", g_pad_root);
+    int done[4] = {0, 0, 0, g_pad_root == 60};   /* pad_root is only added when it isn't the default */
+    FILE *in = fopen(path, "re"), *f = fopen(tmp, "we");
+    if (!f) { if (in) fclose(in); return; }
+    char line[256];
+    while (in && fgets(line, sizeof line, in)) {
+        int k = -1;
+        for (int i = 0; i < 4 && k < 0; i++) {
+            size_t n = strlen(keys[i]);
+            if (!strncmp(line, keys[i], n) && line[n] == '=') k = i;
+        }
+        if (k < 0) { fputs(line, f); continue; }
+        fprintf(f, "%s=%s\n", keys[k], vals[k]);
+        done[k] = 1;
+    }
+    if (in) fclose(in);
+    for (int i = 0; i < 4; i++) if (!done[i]) fprintf(f, "%s=%s\n", keys[i], vals[i]);
     fclose(f);
     rename(tmp, path);
 }
