@@ -513,6 +513,9 @@ static int try_patch(struct mpc_mapping *m)
         if (gen_gate) break;
     }
 
+    if (!gen_gate)
+        LOG("  no generation gate found near padPerformButton ref — not needed on this device");
+
     /*
      * Step 5: Apply patches.
      *
@@ -605,6 +608,59 @@ typedef void (*note_setter_fn_t)(void *, int, int, int);
 static note_setter_fn_t g_note_setter;
 
 static volatile int g_hook_hits;
+
+static int parse_note_name(const char *s)
+{
+    static const char *sharps[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    static const char *flats[]  = {"C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"};
+    int note_class = -1;
+    const char *rest = s;
+    for (int i = 0; i < 12; i++) {
+        size_t slen = strlen(sharps[i]);
+        if (strncasecmp(s, sharps[i], slen) == 0 && slen >= (size_t)(note_class >= 0 ? strlen(sharps[note_class]) : 0))
+            { note_class = i; rest = s + slen; }
+        size_t flen = strlen(flats[i]);
+        if (strncasecmp(s, flats[i], flen) == 0 && flen >= (size_t)(note_class >= 0 ? strlen(sharps[note_class]) : 0))
+            { note_class = i; rest = s + flen; }
+    }
+    if (note_class < 0) return -1;
+    int octave = (*rest >= '0' && *rest <= '9') ? *rest - '0' : 3;
+    int midi = note_class + (octave + 1) * 12;
+    return (midi >= 0 && midi <= 127) ? midi : -1;
+}
+
+static void load_scale_conf(void)
+{
+    char dir[256], path[512];
+    addin_dir(dir, sizeof dir);
+    if (!dir[0]) return;
+    snprintf(path, sizeof path, "%s/mpc_enable_scalemode.conf", dir);
+    FILE *f = fopen(path, "re");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (!eq || line[0] == '#') continue;
+        *eq++ = 0;
+        char *val = eq;
+        val[strcspn(val, "\n\r")] = 0;
+        if (!strcmp(line, "scale")) {
+            for (int i = 0; i < NUM_SCALES; i++) {
+                if (strcasecmp(val, scale_names[i]) == 0) { g_scale_type = i; break; }
+            }
+        } else if (!strcmp(line, "root")) {
+            int midi = parse_note_name(val);
+            if (midi < 0) midi = atoi(val);
+            if (midi >= 0 && midi <= 127) g_root_note = midi;
+        } else if (!strcmp(line, "octave_offset")) {
+            int oct = atoi(val);
+            if (oct >= -4 && oct <= 4) g_octave_offset = oct;
+        }
+    }
+    fclose(f);
+    LOG("conf: scale=%s root=%d octave_offset=%d",
+        scale_names[g_scale_type], g_root_note, g_octave_offset);
+}
 
 static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
 {
@@ -1484,43 +1540,16 @@ static void *socket_worker(void *arg)
             write(c, reply, rlen);
 
         } else if (!strncmp(buf, "root ", 5)) {
-            static const char *note_names[] = {
-                "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
-            };
-            static const char *note_names_flat[] = {
-                "C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"
-            };
-            const char *arg = buf + 5;
-            int note_class = -1;
-            for (int i = 0; i < 12; i++) {
-                if (strncasecmp(arg, note_names[i], strlen(note_names[i])) == 0) {
-                    note_class = i;
-                    arg += strlen(note_names[i]);
-                    break;
-                }
-                if (strncasecmp(arg, note_names_flat[i], strlen(note_names_flat[i])) == 0) {
-                    note_class = i;
-                    arg += strlen(note_names_flat[i]);
-                    break;
-                }
-            }
             char reply[128];
             int rlen;
-            if (note_class >= 0) {
-                int octave = (*arg >= '0' && *arg <= '9') ? *arg - '0' : 3;
-                g_root_note = note_class + (octave + 1) * 12;
-                if (g_root_note > 127) g_root_note = 127;
-                rlen = snprintf(reply, sizeof reply, "root=%d (MIDI %d)\n",
-                                g_root_note, g_root_note);
+            int midi = parse_note_name(buf + 5);
+            if (midi < 0) midi = atoi(buf + 5);
+            if (midi >= 0 && midi <= 127) {
+                g_root_note = midi;
+                rlen = snprintf(reply, sizeof reply, "root=MIDI %d\n", midi);
             } else {
-                int midi = atoi(buf + 5);
-                if (midi >= 0 && midi <= 127) {
-                    g_root_note = midi;
-                    rlen = snprintf(reply, sizeof reply, "root=MIDI %d\n", midi);
-                } else {
-                    rlen = snprintf(reply, sizeof reply,
-                        "usage: root <note>[octave] (e.g. C3, A#2) or root <midi_num>\n");
-                }
+                rlen = snprintf(reply, sizeof reply,
+                    "usage: root <note>[octave] (e.g. C3, A#2) or root <midi_num>\n");
             }
             write(c, reply, rlen);
 
@@ -1615,6 +1644,8 @@ static void *worker(void *arg)
         LOG("no gate found to patch — test if pad perform already works");
     else
         LOG("patch failed (rc=%d)", rc);
+
+    load_scale_conf();
 
     if (install_scale_hook(&m) == 0)
         LOG("scale-map hook active — pads remap in Pad Perform mode");
