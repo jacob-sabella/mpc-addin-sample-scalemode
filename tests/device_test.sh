@@ -31,6 +31,7 @@ short16() { pc note 1 40 127 80 >/dev/null; sleep 0.4; }
 pc status | grep -q 'func=' && ok "padctl socket answers" || { bad "padctl socket"; exit 1; }
 [ "$(scale_on)" = 1 ] && hold
 [ "$(scale_on)" = 0 ] && ok "start with Scale off" || bad "Scale still on"
+if [ "$(pc status | sed -n 's/.*sixteen=\([-0-9]*\).*/\1/p')" = 1 ]; then short16; fi   # start with 16 Levels off, as after MPC starts
 
 t=$(mark); sleep 1; short16; short16; sleep 0.5
 l=$(log_from "$t")
@@ -43,10 +44,10 @@ grep -q 'type-cycle' <<<"$(log_from "$t")" && ok "Shift+16 Levels runs the Type 
 
 hold
 [ "$(scale_on)" = 1 ] && ok "hold 16 Levels: Scale on" || bad "hold did not turn Scale on"
+[ "$(pc status | sed -n 's/.*sixteen=\([-0-9]*\).*/\1/p')" = 1 ] && ok "hold turns 16 Levels on with Scale" || bad "16 Levels not on after the hold"
 o=$(owner); [ "${o:-0}" != 0 ] && ok "SCALE page has the screen (client $o)" || bad "page did not open"
 
 h0=$(hooks); pc note 10 37 100 40 >/dev/null; sleep 0.3
-if [ "$(hooks)" = "$h0" ]; then short16; h0=$(hooks); pc note 10 37 100 40 >/dev/null; sleep 0.3; fi   # 16 Levels was off
 [ "$(hooks)" != "$h0" ] && ok "pads reach the scale hook" || bad "pads do not reach the hook"
 
 dev "rm -rf /tmp/scaletest; mkdir -p /tmp/scaletest; cd /tmp/scaletest
