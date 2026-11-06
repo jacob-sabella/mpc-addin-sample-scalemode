@@ -3,6 +3,7 @@
 # MPC's control-surface stream, filtered like real ones), the screen comes back through the draw handler's /snap.
 # Needs the addin and mpc-addin-sample-draw-handler installed and MPC running. Leaves Scale off and 16 Levels as found.
 #   MPC_HOST=root@<device> [SSH_KEY=~/.ssh/key] tests/device_test.sh [out_dir]
+# RESTART=1 also checks that a scale changed on the page survives an MPC restart (restarts MPC once).
 # out_dir (default build/device-test) gets the page frames while pads play, and page.gif when ffmpeg is installed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -58,6 +59,18 @@ sleep 5
 hold
 [ "$(scale_on)" = 0 ] && ok "hold again: Scale off" || bad "second hold did not turn Scale off"
 sleep 5
+
+if [ "${RESTART:-0}" = 1 ]; then
+    before=$(pc status | sed -n 's/.* scale=\([^ ]*\) .*/\1/p')
+    hold; dev "wget -qO- '$DH/input?key=0&value=1' >/dev/null; wget -qO- '$DH/input?dial=1&value=1' >/dev/null"; sleep 1.5
+    hold; sleep 5
+    changed=$(pc status | sed -n 's/.* scale=\([^ ]*\) .*/\1/p')
+    dev "systemctl restart ac50"; sleep 25
+    after=$(pc status | sed -n 's/.* scale=\([^ ]*\) .*/\1/p')
+    [ "$changed" != "$before" ] && [ "$after" = "$changed" ] && ok "page change survives a restart ($before -> $after)" \
+        || bad "persistence: $before -> $changed -> $after after restart"
+    pc scale "$before" >/dev/null
+fi
 
 mkdir -p "$OUT"
 "${SCP[@]}" "$HOST:/tmp/scaletest/f*.raw" "$OUT/"
