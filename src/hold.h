@@ -263,8 +263,15 @@ static void hold_ensure_sixteen(void)
         nanosleep(&ts, NULL);
     }
     int now = sixteen_on();
-    if (now == 0) hold_press16();   /* it was on after all */
-    LOG("16 Levels %s -> %d", was < 0 ? "unknown" : "off", now == 0 ? 1 : now);
+    if (now == 0) {   /* it was on after all (or MPC took the press for something else): once more */
+        hold_press16();
+        for (int i = 0; i < 25 && sixteen_on() != 1; i++) {
+            struct timespec ts = { 0, 20 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        now = sixteen_on();
+    }
+    LOG("16 Levels %s -> %d", was < 0 ? "unknown" : "off", now);
 }
 
 static void *hold_thread(void *arg)
