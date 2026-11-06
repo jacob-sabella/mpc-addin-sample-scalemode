@@ -64,7 +64,17 @@ octave_offset=2    # -4 to 4; 2 puts bank A's first pad on the root
 hold_ms=800        # how long a hold of 16 Levels toggles Scale (at least 200)
 page=1             # 0: no SCALE page
 padperform_patch=0 # 1 forces the PadPerform bool (blocks 16 Levels)
+pad_root=60        # only when MPC's root note for the sample can't be read (see below)
 ```
+
+**The sample's own note.** Scale reads the root note MPC keeps for the sample
+16 Levels plays (from the WAV's `smpl` chunk when it has one, else 60 = C, and
+editable in MPC) and moves the sample from that note to the scale, by note name:
+slot 0 stays within half an octave of the sample's own pitch, and `octave_offset`
+moves everything by octaves. The page shows it as SAMPLE. A sample tagged with
+the wrong note plays the scale that far off, as it would in a keygroup: one Moog
+lead here sounds C# but its file says D. When the note can't be read (other
+firmware), `pad_root` stands in.
 
 The page and `padctl` rewrite `scale`, `root` and `octave_offset` in place and
 keep the rest of the file.
@@ -106,6 +116,8 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
   sample, so Scale repitches the sample already on the pad.
 - **Reinstall after a reboot.** On the Sample the shared installer puts the
   `LD_PRELOAD` drop-in on `/run`, which is tmpfs; the installer says so.
+- **The sample's note is MPC's.** Scale doesn't measure the audio; a wrong or
+  missing root note in the file (an untagged sample reads as C) moves the scale with it.
 - **Type names not mapped.** `padctl status` prints the native Type as a number (0-2).
 
 ## How it works
@@ -116,7 +128,10 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
    past `hold_ms` (Scale toggles, MPC sees nothing). With Shift down it passes
    straight through. The draw handler wraps the same calls; the two chain.
 3. It hooks the note mapping function with a PACIASP trampoline that, while Scale
-   is on, repitches each slot through the scale tables via the note setter.
+   is on, repitches each slot through the scale tables via the note setter, from
+   the sample's root note (16 Levels pad -> program -> instrument -> layer ->
+   sample, each pointer read through `/proc/self/mem`, so a wrong one fails
+   instead of crashing MPC).
 4. The SCALE page is a draw handler client: it takes the screen when Scale
    toggles and gives it back when idle.
 5. A socket server on `/tmp/padmode.sock` accepts `padctl` commands.

@@ -722,6 +722,8 @@ static int sixteen_on(void)
     return inner ? *(volatile uint8_t *)(inner + 0x2a3) & 1 : -1;
 }
 
+static volatile int g_sample_root;
+static int slot_offset(int slot, int sample_root, int *root_off_out);
 #include "scale_page.h"
 #include "hold.h"
 
@@ -748,9 +750,65 @@ static int sixteen_button_hook(void *self)
     return 0;
 }
 
+
+/* Memory read through /proc/self/mem: a stale or wrong pointer fails instead of crashing MPC. */
+static int g_mem_fd = -1;
+static int mem_read(uintptr_t a, void *out, size_t n)
+{
+    if (g_mem_fd < 0) {
+        int fd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0 && !__sync_bool_compare_and_swap(&g_mem_fd, -1, fd)) close(fd);
+    }
+    return g_mem_fd >= 0 && pread(g_mem_fd, out, n, (off_t)a) == (ssize_t)n ? 0 : -1;
+}
+static int mem_ptr(uintptr_t a, uintptr_t *v) { return mem_read(a, v, 8) == 0 && *v > 0x10000 && *v < 0x0001000000000000ULL && !(*v & 7) ? 0 : -1; }
+
+
+/* The root note of the sample 16 Levels plays, as MPC keeps it (the one its root note setting edits, 0x29458c0 in firmware
+ * 1.3.0.12): 16 Levels object +0x104 = its pad; the program (two paths from that object, checked by its 128 instruments)
+ * +0x2808 = instruments[pad]; instrument +0x22e8 = layer 1, +0x4a8 = sample, +0x130 = its data, +0x3e4 = root note.
+ * Every step goes through mem_read. -1 when any step fails (no sample, other firmware): then pad_root stands in. */
+static volatile int g_sample_root = -1;   /* the last one read, for the page and status */
+
+static int sample_root_of(uintptr_t sixteen)
+{
+    static const uint16_t paths[][2] = { { 0x110, 0x110 }, { 0x10, 0x210 } };   /* to the track; +0xb8 is its program */
+    int32_t pad, root;
+    uintptr_t a, trk, prog = 0, vb, ve, ins, lay, smp, dat;
+    if (!sixteen || mem_read(sixteen + 0x104, &pad, 4) || pad < 0 || pad > 127) return -1;
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0] && !prog; i++) {
+        uintptr_t p;
+        if (mem_ptr(sixteen + paths[i][0], &a) || mem_ptr(a + paths[i][1], &trk) || mem_ptr(trk + 0xb8, &p)) continue;
+        if (mem_ptr(p + 0x2808, &vb) || mem_ptr(p + 0x2810, &ve) || ve - vb != 128 * 8) continue;
+        prog = p;
+    }
+    if (!prog || mem_ptr(vb + (uintptr_t)pad * 8, &ins) || mem_ptr(ins + 0x22e8, &lay) || mem_ptr(lay + 0x4a8, &smp)
+        || mem_ptr(smp + 0x130, &dat) || mem_read(dat + 0x3e4, &root, 4) || root < 0 || root > 127)
+        return -1;
+    return root;
+}
+
+/* Semitones from the sample's own pitch for a slot: the scale from the chosen root, by note name (the sample's octave is
+ * kept, so slot 0 is within half an octave of it), then octave_offset. */
+static int slot_offset(int slot, int sample_root, int *root_off_out)
+{
+    int sc = g_scale_type;
+    if (sc < 0 || sc >= NUM_SCALES) sc = 0;
+    int npo = scale_npo[sc];
+    int base = sample_root >= 0 ? sample_root : g_pad_root;
+    int root_off = (g_root_note % 12) - (base % 12);
+    if (root_off > 5)  root_off -= 12;
+    if (root_off < -6) root_off += 12;
+    if (root_off_out) *root_off_out = root_off;
+    int note = scale_intervals[sc][slot % npo] + (slot / npo + g_octave_offset) * 12 + root_off - 24;
+    return note < -120 ? -120 : note > 120 ? 120 : note;
+}
+
+static void *volatile g_last_ctx;   /* the 16 Levels object of the last pad hit (testmap) */
+
 static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
 {
-    (void)ctx;
+    g_last_ctx = ctx;
     int hits = __sync_add_and_fetch(&g_hook_hits, 1);
     if (hits <= 16 || (hits & 0xFF) == 0)
         LOG("hook[%d]: type=%d scale_on=%d pad_val=0x%lx",
@@ -759,25 +817,14 @@ static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
     if (!g_scale_on) return 0;
 
     int pad = (int)(pad_val & 0xF);
-    int sc  = g_scale_type;
-    if (sc < 0 || sc >= NUM_SCALES) sc = 0;
-
-    int npo      = scale_npo[sc];
-    int octave   = pad / npo;
-    int degree   = pad % npo;
-    int interval = scale_intervals[sc][degree];
-
-    int root_off = (g_root_note % 12) - (g_pad_root % 12);
-    if (root_off > 5)  root_off -= 12;
-    if (root_off < -6) root_off += 12;
-
-    int note = interval + (octave + g_octave_offset) * 12 + root_off - 24;
-    if (note < -120) note = -120;
-    if (note > 120)  note = 120;
+    int sroot = sample_root_of((uintptr_t)ctx);   /* ctx: the 16 Levels object */
+    g_sample_root = sroot;
+    int root_off;
+    int note = slot_offset(pad, sroot, &root_off);
 
     if (hits <= 16)
-        LOG("hook[%d]: pad=%d scale=%s offset=%d (root_off=%d interval=%d oct=%d)",
-            hits, pad, scale_names[sc], note, root_off, interval, octave);
+        LOG("hook[%d]: pad=%d scale=%s sample_root=%d offset=%d (root_off=%d)",
+            hits, pad, scale_names[g_scale_type >= 0 && g_scale_type < NUM_SCALES ? g_scale_type : 0], sroot, note, root_off);
 
     page_note_hit(pad);
     *(volatile uint8_t *)((uintptr_t)pad_ctx + 0x31) = 0;
@@ -1676,22 +1723,11 @@ static void *socket_worker(void *arg)
             int pad = (!strncmp(buf, "testmap ", 8)) ? atoi(buf + 8) : 0;
             if (pad < 0) pad = 0;
             if (pad > 15) pad = 15;
-            int sc = g_scale_type;
-            if (sc < 0 || sc >= NUM_SCALES) sc = 0;
-            int npo = scale_npo[sc];
-            int octave = pad / npo;
-            int degree = pad % npo;
-            int interval = scale_intervals[sc][degree];
-            int ro = (g_root_note % 12) - (g_pad_root % 12);
-            if (ro > 5)  ro -= 12;
-            if (ro < -6) ro += 12;
-            int note = interval + (octave + g_octave_offset) * 12 + ro - 24;
-            if (note < -120) note = -120;
-            if (note > 120)  note = 120;
+            int ro, sroot = g_last_ctx ? sample_root_of((uintptr_t)g_last_ctx) : -1;
+            int note = slot_offset(pad, sroot, &ro);
             char reply[256];
-            int rlen = snprintf(reply, sizeof reply,
-                "pad=%d scale=%s degree=%d interval=%d octave=%d root_off=%d -> offset %d\n",
-                pad, scale_names[sc], degree, interval, octave, ro, note);
+            int rlen = snprintf(reply, sizeof reply, "pad=%d scale=%s sample_root=%d root_off=%d -> offset %d\n",
+                pad, scale_names[g_scale_type >= 0 && g_scale_type < NUM_SCALES ? g_scale_type : 0], sroot, ro, note);
             write(c, reply, rlen);
 
         } else if (!strncmp(buf, "note ", 5)) {
@@ -1779,13 +1815,13 @@ static void *socket_worker(void *arg)
                 int mode = inner ? *(volatile int32_t *)(inner + 0x34) : -1;
                 rlen = snprintf(reply, sizeof reply,
                     "func=%p set_mode=%p this=%p%s inner=%p type=%d sixteen=%d scale_on=%d "
-                    "scale=%s root=%d oct=%d setter=%p main_tid=%lu\n",
+                    "scale=%s root=%d oct=%d sample_root=%d setter=%p main_tid=%lu\n",
                     (void *)g_cycle_func, (void *)g_set_mode_func,
                     self, g_type_ctl ? " (from firmware)" : " (scanned)",
                     (void *)inner, mode, sixteen_on(), g_scale_on,
                     (g_scale_type >= 0 && g_scale_type < NUM_SCALES)
                         ? scale_names[g_scale_type] : "?",
-                    g_root_note, g_octave_offset,
+                    g_root_note, g_octave_offset, g_sample_root,
                     (void *)g_note_setter,
                     (unsigned long)g_main_thread);
             } else {

@@ -37,12 +37,11 @@ static long long pg_now_ms(void)
 static void page_popup(void) { g_pg_want = 1; }
 static void page_note_hit(int slot) { long long t = pg_now_ms(); g_pg_hit_ms = t; g_pg_touch = t; g_pg_hit_slot = slot; }   /* playing keeps the page up */
 
+/* what a slot sounds: the sample's root (as MPC has it, else pad_root) moved by the slot's offset */
 static int slot_midi(int slot)
 {
-    int sc = g_scale_type;
-    if (sc < 0 || sc >= NUM_SCALES) sc = 0;
-    int npo = scale_npo[sc];
-    return g_root_note + scale_intervals[sc][slot % npo] + (slot / npo + g_octave_offset - 2) * 12;
+    int sr = g_sample_root;
+    return (sr >= 0 ? sr : g_pad_root) + slot_offset(slot, sr, NULL);
 }
 
 static void note_name(char *out, size_t n, int midi)
@@ -103,12 +102,16 @@ static void pg_render(sdc_canvas *cv)
 
     int sc = g_scale_type;
     if (sc < 0 || sc >= NUM_SCALES) sc = 0;
-    char root[8], line[48];
-    note_name(root, sizeof root, g_root_note);
+    static const char *names[] = {"C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"};
+    char root[8], line[48], smp[16];
+    snprintf(root, sizeof root, "%s", names[g_root_note % 12]);
     sdc_text(cv, 8, 28, 3, g_pg_field == 0 ? PG_PINK : PG_CYAN, scale_names[sc]);
     int x = sdc_text(cv, 8, 56, 2, g_pg_field == 1 ? PG_PINK : PG_TEXT, root);
     snprintf(line, sizeof line, "OCT %d", g_octave_offset);
     sdc_text(cv, x + 18, 56, 2, g_pg_field == 2 ? PG_PINK : PG_TEXT, line);
+    if (g_sample_root >= 0) { char nn[8]; note_name(nn, sizeof nn, g_sample_root); snprintf(smp, sizeof smp, "SAMPLE %s", nn); }
+    else snprintf(smp, sizeof smp, "SAMPLE ?");
+    sdc_text(cv, x + 18 + sdc_text_width(line, 2) + 18, 60, 1, PG_DIM, smp);
     const char *state = g_scale_on ? "ON" : "OFF";
     sdc_text(cv, cv->w - 8 - sdc_text_width(state, 2), 56, 2, g_scale_on ? PG_CYAN : PG_DIM, state);
     sdc_text(cv, 8, 76, 1, PG_DIM, "DIAL: CHANGE   PRESS: DONE   K1-K3: SET");
@@ -169,7 +172,7 @@ static void *page_thread(void *arg)
             cv.px = g_pg_api->pixels(g_pg, &cv.stride);
             cv.w = g_pg_api->width;
             cv.h = g_pg_api->height;
-            int sig = ((((g_scale_type * 128 + g_root_note) * 16 + g_octave_offset + 8) * 4 + g_pg_field) * 2 + g_scale_on);
+            int sig = ((((g_scale_type * 128 + g_root_note) * 16 + g_octave_offset + 8) * 4 + g_pg_field) * 2 + g_scale_on) * 129 + g_sample_root + 1;
             int lit = g_pg_hit_slot >= 0 && now - g_pg_hit_ms < 250 ? g_pg_hit_slot : -1;
             g_pg_lit = lit;
             if (!was_up || sig != last_sig) {

@@ -53,6 +53,8 @@ o=$(owner); [ "${o:-0}" != 0 ] && ok "SCALE page has the screen (client $o)" || 
 
 h0=$(hooks); pc note 10 37 100 40 >/dev/null; sleep 0.3
 [ "$(hooks)" != "$h0" ] && ok "pads reach the scale hook" || bad "pads do not reach the hook"
+sr=$(pc status | sed -n 's/.*sample_root=\([-0-9]*\).*/\1/p')
+[ -n "$sr" ] && [ "$sr" -ge 0 ] && ok "reads MPC's root note for the sample ($sr)" || bad "sample root note not read (${sr:-none})"
 
 dev "rm -rf /tmp/scaletest; mkdir -p /tmp/scaletest; cd /tmp/scaletest
      ( for i in \$(seq 1 6); do for n in $PADS; do $P note 10 \$n 110 60 >/dev/null; sleep 0.2; done; done ) &
