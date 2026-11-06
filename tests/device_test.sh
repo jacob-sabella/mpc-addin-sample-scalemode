@@ -4,7 +4,8 @@
 # Needs the addin and mpc-addin-sample-draw-handler installed and MPC running. Leaves Scale off and 16 Levels as found.
 #   MPC_HOST=root@<device> [SSH_KEY=~/.ssh/key] tests/device_test.sh [out_dir]
 # AUDIO_SRC=<PulseAudio/PipeWire source of the Sample's USB audio> also records the 16 slots in Blues and checks each one's
-# pitch (tests/pitch_check.py; PITCH_MODE=clicks for a sample with two or more transients, spectrum for a sustained one).
+# pitch (tests/pitch_check.py). Load a pitched sample on the 16 Levels pad first (a saw at C3 with a short fade works best;
+# PITCH_MODE=clicks instead for a drum sample with two or more transients).
 # RESTART=1 also checks that a scale changed on the page survives an MPC restart (restarts MPC once).
 # out_dir (default build/device-test) gets the page frames while pads play, and page.gif when ffmpeg is installed.
 set -euo pipefail
@@ -56,8 +57,8 @@ dev "rm -rf /tmp/scaletest; mkdir -p /tmp/scaletest; cd /tmp/scaletest
      ( for i in \$(seq 1 6); do for n in $PADS; do $P note 10 \$n 110 60 >/dev/null; sleep 0.2; done; done ) &
      i=0; while [ \$i -lt 40 ]; do wget -qO f\$(printf %02d \$i).raw $DH/snap; i=\$((i+1)); sleep 0.1; done; wait"
 o=$(owner); [ "${o:-0}" != 0 ] && ok "page stays up while pads play" || bad "page closed while pads played"
-sleep 5
-[ "$(owner)" = 0 ] && ok "page gives the screen back after idle" || bad "page still up after idle"
+sleep 6
+o=$(owner); [ "${o:-0}" != 0 ] && ok "page stays up with Scale on, no input for 6 s" || bad "page closed with Scale on"
 
 if [ -n "${AUDIO_SRC:-}" ]; then
     mkdir -p "$OUT"; sleep 2; was=$(pc status | sed -n 's/.* scale=\([^ ]*\) .*/\1/p'); pc scale Blues >/dev/null
@@ -66,7 +67,7 @@ if [ -n "${AUDIO_SRC:-}" ]; then
     dev "for n in 37 36 42 82 40 38 46 44 48 47 45 43 49 55 51 53; do $P note 10 \$n 110 1600 >/dev/null; sleep 0.2; done"
     wait $rec || true; pc scale "$was" >/dev/null
     BLUES=0,3,5,6,7,10,12,15,17,18,19,22,24,27,29,30
-    if [ "${PITCH_MODE:-clicks}" = clicks ]; then args=(clicks "$OUT/slots.wav" 16 $BLUES); else args=(spectrum "$OUT/slots.wav" 1.0 1.8 16 $BLUES); fi
+    if [ "${PITCH_MODE:-spectrum}" = clicks ]; then args=(clicks "$OUT/slots.wav" 16 $BLUES); else args=(spectrum "$OUT/slots.wav" auto 1.8 16 $BLUES); fi
     python3 tests/pitch_check.py "${args[@]}" > "$OUT/pitch.txt" && ok "the 16 slots sound in Blues (audio, $OUT/pitch.txt)" \
         || { bad "slot pitches (audio)"; cat "$OUT/pitch.txt"; }
 fi
@@ -74,6 +75,7 @@ fi
 hold
 [ "$(scale_on)" = 0 ] && ok "hold again: Scale off" || bad "second hold did not turn Scale off"
 sleep 5
+[ "$(owner)" = 0 ] && ok "with Scale off the page gives the screen back after idle" || bad "page still up after Scale off"
 
 if [ "${RESTART:-0}" = 1 ]; then
     before=$(pc status | sed -n 's/.* scale=\([^ ]*\) .*/\1/p')

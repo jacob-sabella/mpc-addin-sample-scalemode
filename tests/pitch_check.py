@@ -2,14 +2,15 @@
 """Pitch of each pad hit in a recording of MPC's audio (the Sample's USB audio), relative to the first hit.
 
     pitch_check.py clicks   rec.wav count [expected]
-    pitch_check.py spectrum rec.wav first_s step_s count [expected]
+    pitch_check.py spectrum rec.wav first_s|auto step_s count [expected]
 
 expected: semitones per hit, comma separated; exit 1 when a hit is more than 0.25 semitone off.
 
 Repitching a sample by r plays it r times faster, so:
 - clicks: for a sample with two or more transients (drums, clicks). Hits are told apart by silence (0.6 s), and the
   time from a hit's first transient to its last shrinks by r.
-- spectrum: for a sustained, pitched sample, hits every step_s from first_s. Each hit's log-magnitude spectrum is
+- spectrum: for a pitched sample (tests use a saw at C3 with a short fade), hits every step_s from first_s, or with auto
+  each at its attack (the level jumps 2.5 times within 30 ms, at least 0.7 step_s after the last). Each hit's log-magnitude spectrum is
   matched against the first one's over stretches 2^(s/12), s from -12 to +36 in 0.05 steps."""
 import sys, wave
 import numpy as np
@@ -36,11 +37,21 @@ if mode == 'clicks':
     if span[0] <= 0: sys.exit('the first hit has one transient: use spectrum')
     semis = [12 * np.log2(span[0] / s) if s > 0 else float('nan') for s in span]
 elif mode == 'spectrum':
-    first, step, n = float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]); exp_arg = sys.argv[6] if len(sys.argv) > 6 else None
+    step, n = float(sys.argv[4]), int(sys.argv[5]); exp_arg = sys.argv[6] if len(sys.argv) > 6 else None
+    if sys.argv[3] == 'auto':
+        fr = int(0.01 * sr); env = np.array([np.abs(x[i:i + fr]).max() for i in range(0, len(x) - fr, fr)])
+        starts = []
+        for i in range(3, len(env)):
+            if env[i] > 0.2 and env[i] > 2.5 * env[i - 3] and (not starts or i * 0.01 - starts[-1] > 0.7 * step):
+                starts.append(i * 0.01)
+        if len(starts) < n: sys.exit(f'{len(starts)} hits found, {n} expected')
+        starts = [v + 0.02 for v in starts[-n:]]   # past the attack
+    else:
+        starts = [float(sys.argv[3]) + k * step for k in range(n)]
     N = 1 << 15; freqs = np.fft.rfftfreq(N, 1 / sr); grid = np.geomspace(25, 8000, 2400)
 
     def spectrum(k):
-        a = int((first + k * step) * sr); seg = x[a:a + int(step * 0.9 * sr)]
+        a = int(starts[k] * sr); seg = x[a:a + int(step * 0.6 * sr)]
         seg = np.pad(seg, (0, max(0, N - len(seg))))[:N] * np.hanning(N)
         return np.interp(grid, freqs, np.log1p(np.abs(np.fft.rfft(seg))))
 
