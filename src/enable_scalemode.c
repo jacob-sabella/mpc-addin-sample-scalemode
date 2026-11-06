@@ -38,10 +38,12 @@
 struct conf {
     int enabled;
     int padperform_patch; /* force the PadPerform "supported" bool (blocks 16 Levels) */
-    int scale_slot;       /* native 16 Levels Type value that Scale follows in the cycle */
+    int page;             /* the SCALE page on the screen (needs the draw handler addin) */
+    int hold_note;        /* the button whose long hold toggles Scale: 16 Levels */
+    int hold_ms;
 };
 
-static struct conf C = { .enabled = 1, .padperform_patch = 0, .scale_slot = 1 };
+static struct conf C = { .enabled = 1, .padperform_patch = 0, .page = 1, .hold_note = 40, .hold_ms = 800 };
 
 static void addin_dir(char *out, size_t n)
 {
@@ -82,7 +84,9 @@ static void load_conf(void)
         val[strcspn(val, "\n\r")] = 0;
         if (!strcmp(line, "enabled")) C.enabled = atoi(val);
         else if (!strcmp(line, "padperform_patch")) C.padperform_patch = atoi(val);
-        else if (!strcmp(line, "scale_slot")) C.scale_slot = atoi(val);
+        else if (!strcmp(line, "page")) C.page = atoi(val);
+        else if (!strcmp(line, "hold_note")) C.hold_note = atoi(val);
+        else if (!strcmp(line, "hold_ms")) C.hold_ms = atoi(val) >= 200 ? atoi(val) : 200;
     }
     fclose(f);
 }
@@ -691,6 +695,9 @@ static void save_conf(void)
 static volatile int g_scale_on;   /* Scale selected as the 16 Levels Type */
 static void *volatile g_type_ctl; /* Type controller, captured from the firmware's cycle call */
 
+#include "scale_page.h"
+#include "hold.h"
+
 static int current_type(void)
 {
     void *self = g_type_ctl;
@@ -699,23 +706,11 @@ static int current_type(void)
     return inner ? *(volatile int32_t *)(inner + 0x34) : -1;
 }
 
-/* Shift+16 Levels. Returning 1 skips the native advance, so Scale sits after
- * Type value C.scale_slot with that native Type left in place underneath. */
+/* Shift+16 Levels (the native Type cycle): only hands over the controller, for padctl. */
 static int type_cycle_hook(void *self)
 {
     g_type_ctl = self;
-    int cur = current_type();
-    if (g_scale_on) {
-        g_scale_on = 0;
-        LOG("type-cycle: Scale -> native advance from type %d", cur);
-        return 0;
-    }
-    if (cur == C.scale_slot) {
-        g_scale_on = 1;
-        LOG("type-cycle: type %d -> Scale", cur);
-        return 1;
-    }
-    LOG("type-cycle: native advance from type %d", cur);
+    LOG("type-cycle: from type %d", current_type());
     return 0;
 }
 
@@ -756,6 +751,7 @@ static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
         LOG("hook[%d]: pad=%d scale=%s offset=%d (root_off=%d interval=%d oct=%d)",
             hits, pad, scale_names[sc], note, root_off, interval, octave);
 
+    page_note_hit(pad);
     *(volatile uint8_t *)((uintptr_t)pad_ctx + 0x31) = 0;
 
     if (g_note_setter)
@@ -989,7 +985,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
         g_pending_setmode = -1;
     }
 
-    return real_poll(fds, nfds, timeout);
+    return hold_mark(fds, nfds, real_poll(fds, nfds, hold_pending() >= 0 ? 0 : timeout));
 }
 
 static int find_this_pointer(struct mpc_mapping *m, uintptr_t cycle_func)
@@ -1663,6 +1659,10 @@ static void *socket_worker(void *arg)
                 pad, scale_names[sc], degree, interval, octave, ro, note);
             write(c, reply, rlen);
 
+        } else if (!strcmp(buf, "page")) {
+            page_popup();
+            const char *r = g_pg ? "page: opening\n" : "page: no SCALE page (draw handler missing?)\n";
+            write(c, r, strlen(r));
         } else if (!strcmp(buf, "hookhits")) {
             char reply[128];
             int rlen = snprintf(reply, sizeof reply, "hook_hits=%d\n", g_hook_hits);
@@ -1753,9 +1753,12 @@ static void *worker(void *arg)
     uintptr_t cycle = find_cycle_func(&m);
 
     if (install_scale_hook(&m) == 0)
-        LOG("scale-map hook active — pads remap when Scale is the 16 Levels Type");
+        LOG("scale-map hook active — hold 16 Levels to toggle Scale");
     else
         LOG("scale-map hook failed — note remapping unavailable");
+
+    if (C.page) page_start();
+    hold_start();
 
     g_cycle_func = cycle;
     pthread_t stid;
