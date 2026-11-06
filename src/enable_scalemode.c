@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <ucontext.h>
 #include <sys/socket.h>
@@ -571,6 +572,175 @@ static int try_patch(struct mpc_mapping *m)
     }
 
     return patches_applied > 0 ? 0 : 1;
+}
+
+/* ── PACIASP function hook infrastructure ── */
+
+#define NOTE_MAP_OFFSET   0x21472f0
+#define NOTE_SETTER_OFFSET 0x27e4400
+
+static const int scale_intervals[][12] = {
+    {0,1,2,3,4,5,6,7,8,9,10,11}, /* Chromatic  (12) */
+    {0,2,4,5,7,9,11,0,0,0,0,0},  /* Major       (7) */
+    {0,2,3,5,7,8,10,0,0,0,0,0},  /* Natural Min (7) */
+    {0,2,3,5,7,8,11,0,0,0,0,0},  /* Harm Minor  (7) */
+    {0,2,4,5,7,9,10,0,0,0,0,0},  /* Dorian      (7) */
+    {0,3,5,6,7,10,0,0,0,0,0,0},  /* Blues        (6) */
+    {0,1,3,5,7,8,10,0,0,0,0,0},  /* Phrygian    (7) */
+    {0,2,4,5,7,9,10,0,0,0,0,0},  /* Mixolydian  (7) */
+};
+static const int scale_npo[] = {12, 7, 7, 7, 7, 6, 7, 7};
+#define NUM_SCALES ((int)(sizeof scale_npo / sizeof *scale_npo))
+
+static const char *scale_names[] = {
+    "Chromatic","Major","Minor","Harm Minor",
+    "Dorian","Blues","Phrygian","Mixolydian",
+};
+
+static volatile int g_scale_type    = 5;  /* Blues */
+static volatile int g_root_note     = 48; /* C3 */
+static volatile int g_octave_offset = 0;
+
+typedef void (*note_setter_fn_t)(void *, int, int, int);
+static note_setter_fn_t g_note_setter;
+
+static volatile int g_hook_hits;
+
+static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
+{
+    int mode = *(volatile int *)((uintptr_t)ctx + 0x88);
+    int hits = __sync_add_and_fetch(&g_hook_hits, 1);
+    if (hits <= 16 || (hits & 0xFF) == 0)
+        LOG("hook[%d]: mode=%d pad_val=0x%lx ctx=%p pad_ctx=%p",
+            hits, mode, (unsigned long)pad_val, ctx, pad_ctx);
+
+    if (mode != 1) return 0;
+
+    int pad = (int)(pad_val & 0xF);
+    int sc  = g_scale_type;
+    if (sc < 0 || sc >= NUM_SCALES) sc = 0;
+
+    int npo      = scale_npo[sc];
+    int octave   = pad / npo;
+    int degree   = pad % npo;
+    int interval = scale_intervals[sc][degree];
+    int note     = g_root_note + interval + (octave + g_octave_offset) * 12;
+
+    if (note < 0)   note = 0;
+    if (note > 127) note = 127;
+
+    if (hits <= 16)
+        LOG("hook[%d]: pad=%d scale=%s note=%d (root=%d interval=%d oct=%d)",
+            hits, pad, scale_names[sc], note, g_root_note, interval, octave);
+
+    *(volatile uint8_t *)((uintptr_t)pad_ctx + 0x31) = 0;
+
+    if (g_note_setter)
+        g_note_setter((void *)((uintptr_t)pad_ctx + 0x14), 0, 0, note);
+
+    return 1;
+}
+
+static void *hook_alloc_near(uintptr_t target)
+{
+    long pgsz = sysconf(_SC_PAGESIZE);
+    uintptr_t base = target & ~(uintptr_t)(pgsz - 1);
+
+    for (uintptr_t off = 0x200000; off < 0x7000000; off += (uintptr_t)pgsz) {
+        void *p = mmap((void *)(base - off), pgsz, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == MAP_FAILED) continue;
+        if (p == (void *)(base - off)) return p;
+        munmap(p, pgsz);
+    }
+    for (uintptr_t off = 0x200000; off < 0x7000000; off += (uintptr_t)pgsz) {
+        void *p = mmap((void *)(base + off), pgsz, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == MAP_FAILED) continue;
+        if (p == (void *)(base + off)) return p;
+        munmap(p, pgsz);
+    }
+    return NULL;
+}
+
+static int install_paciasp_hook(uintptr_t target, void *callback, const char *name)
+{
+    uint32_t first = *(volatile uint32_t *)target;
+    if (first != 0xd503233f) {
+        LOG("%s: target %p not PACIASP (0x%08x)", name, (void *)target, first);
+        return -1;
+    }
+
+    void *tramp = hook_alloc_near(target);
+    if (!tramp) {
+        LOG("%s: alloc_near failed", name);
+        return -1;
+    }
+
+    uint64_t *t = (uint64_t *)tramp;
+    t[0]  = 0xa90007e0d10143ffULL; /* SUB SP,#0x50; STP X0,X1,[SP]       */
+    t[1]  = 0xa90217e4a9010fe2ULL; /* STP X2,X3,[SP,#0x10]; STP X4,X5    */
+    t[2]  = 0xa9047be8a9031fe6ULL; /* STP X6,X7,[SP,#0x30]; STP X8,X30   */
+    t[3]  = 0xd63f0200580001d0ULL; /* LDR X16,[PC,#0x38]; BLR X16        */
+    t[4]  = 0xa94007e02a0003f1ULL; /* MOV W17,W0; LDP X0,X1,[SP]         */
+    t[5]  = 0xa94217e4a9410fe2ULL; /* LDP X2,X3; LDP X4,X5               */
+    t[6]  = 0xa9447be8a9431fe6ULL; /* LDP X6,X7; LDP X8,X30              */
+    t[7]  = 0x35000071910143ffULL; /* ADD SP,#0x50; CBNZ W17,+12         */
+    *(uint32_t *)((char *)tramp + 0x40) = 0xd503233f; /* PACIASP (orig)  */
+
+    int64_t back = ((int64_t)(target + 4) - (int64_t)((uintptr_t)tramp + 0x44)) / 4;
+    *(uint32_t *)((char *)tramp + 0x44) = 0x14000000 | ((uint32_t)back & 0x3FFFFFF);
+
+    t[9]  = 0xd503201fd65f03c0ULL; /* RET; NOP                           */
+    t[10] = (uint64_t)(uintptr_t)callback;
+
+    long pgsz = sysconf(_SC_PAGESIZE);
+    if (mprotect((void *)((uintptr_t)tramp & ~(uintptr_t)(pgsz - 1)),
+                 pgsz, PROT_READ | PROT_EXEC) != 0) {
+        LOG("%s: mprotect trampoline failed", name);
+        munmap(tramp, pgsz);
+        return -1;
+    }
+    __builtin___clear_cache(tramp, (char *)tramp + 0x58);
+
+    int64_t fwd = ((int64_t)(uintptr_t)tramp - (int64_t)target) / 4;
+    if (fwd < -0x2000000 || fwd > 0x1FFFFFF) {
+        LOG("%s: trampoline out of B range (%ld)", name, (long)fwd);
+        return -1;
+    }
+
+    uint32_t b_insn = 0x14000000 | ((uint32_t)fwd & 0x3FFFFFF);
+    if (patch_insn(target, 0xd503233f, b_insn) != 0) {
+        LOG("%s: patch target failed", name);
+        return -1;
+    }
+
+    LOG("%s: hook installed target=%p trampoline=%p", name, (void *)target, tramp);
+    return 0;
+}
+
+static int install_scale_hook(struct mpc_mapping *m)
+{
+    uintptr_t note_map = m->base + NOTE_MAP_OFFSET;
+    uintptr_t note_set = m->base + NOTE_SETTER_OFFSET;
+
+    uint32_t nm_first = insn_at(note_map);
+    if (nm_first != 0xd503233f) {
+        LOG("note-map at %p not PACIASP (0x%08x) — skipping hook",
+            (void *)note_map, nm_first);
+        return -1;
+    }
+
+    uint32_t ns_first = insn_at(note_set);
+    if (ns_first != 0xd503233f) {
+        LOG("note-setter at %p not PACIASP (0x%08x) — skipping hook",
+            (void *)note_set, ns_first);
+        return -1;
+    }
+    g_note_setter = (note_setter_fn_t)note_set;
+    LOG("note-setter at %p", (void *)note_set);
+
+    return install_paciasp_hook(note_map, (void *)scale_map_hook, "scale_map");
 }
 
 /* ── pad-mode cycling trigger ── */
@@ -1289,17 +1459,111 @@ static void *socket_worker(void *arg)
             }
             write(c, reply, rlen);
 
+        } else if (!strncmp(buf, "scale ", 6)) {
+            const char *name = buf + 6;
+            int found = -1;
+            for (int i = 0; i < NUM_SCALES; i++) {
+                if (strcasecmp(name, scale_names[i]) == 0) { found = i; break; }
+            }
+            if (found < 0) {
+                /* try prefix match */
+                size_t len = strlen(name);
+                for (int i = 0; i < NUM_SCALES; i++) {
+                    if (strncasecmp(name, scale_names[i], len) == 0) { found = i; break; }
+                }
+            }
+            char reply[128];
+            int rlen;
+            if (found >= 0) {
+                g_scale_type = found;
+                rlen = snprintf(reply, sizeof reply, "scale=%s (%d)\n",
+                                scale_names[found], found);
+            } else {
+                rlen = snprintf(reply, sizeof reply, "unknown scale '%s'\n", name);
+            }
+            write(c, reply, rlen);
+
+        } else if (!strncmp(buf, "root ", 5)) {
+            static const char *note_names[] = {
+                "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+            };
+            static const char *note_names_flat[] = {
+                "C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"
+            };
+            const char *arg = buf + 5;
+            int note_class = -1;
+            for (int i = 0; i < 12; i++) {
+                if (strncasecmp(arg, note_names[i], strlen(note_names[i])) == 0) {
+                    note_class = i;
+                    arg += strlen(note_names[i]);
+                    break;
+                }
+                if (strncasecmp(arg, note_names_flat[i], strlen(note_names_flat[i])) == 0) {
+                    note_class = i;
+                    arg += strlen(note_names_flat[i]);
+                    break;
+                }
+            }
+            char reply[128];
+            int rlen;
+            if (note_class >= 0) {
+                int octave = (*arg >= '0' && *arg <= '9') ? *arg - '0' : 3;
+                g_root_note = note_class + (octave + 1) * 12;
+                if (g_root_note > 127) g_root_note = 127;
+                rlen = snprintf(reply, sizeof reply, "root=%d (MIDI %d)\n",
+                                g_root_note, g_root_note);
+            } else {
+                int midi = atoi(buf + 5);
+                if (midi >= 0 && midi <= 127) {
+                    g_root_note = midi;
+                    rlen = snprintf(reply, sizeof reply, "root=MIDI %d\n", midi);
+                } else {
+                    rlen = snprintf(reply, sizeof reply,
+                        "usage: root <note>[octave] (e.g. C3, A#2) or root <midi_num>\n");
+                }
+            }
+            write(c, reply, rlen);
+
+        } else if (!strncmp(buf, "octave ", 7)) {
+            int oct = atoi(buf + 7);
+            if (oct < -4) oct = -4;
+            if (oct > 4)  oct = 4;
+            g_octave_offset = oct;
+            char reply[64];
+            int rlen = snprintf(reply, sizeof reply, "octave_offset=%d\n", oct);
+            write(c, reply, rlen);
+
+        } else if (!strcmp(buf, "hookhits")) {
+            char reply[128];
+            int rlen = snprintf(reply, sizeof reply, "hook_hits=%d\n", g_hook_hits);
+            write(c, reply, rlen);
+
+        } else if (!strcmp(buf, "scaleinfo")) {
+            char reply[256];
+            int rlen = snprintf(reply, sizeof reply,
+                "scale=%s (%d) root=%d octave_offset=%d note_setter=%p\n",
+                (g_scale_type >= 0 && g_scale_type < NUM_SCALES)
+                    ? scale_names[g_scale_type] : "?",
+                g_scale_type, g_root_note, g_octave_offset,
+                (void *)g_note_setter);
+            write(c, reply, rlen);
+
         } else if (!strcmp(buf, "status")) {
             void *self = resolve_this_ptr();
-            char reply[192];
+            char reply[256];
             int rlen;
             if (self) {
                 uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
                 int mode = inner ? *(volatile int32_t *)(inner + 0x34) : -1;
                 rlen = snprintf(reply, sizeof reply,
-                    "func=%p set_mode=%p this=%p inner=%p mode=%d (%s) main_tid=%lu\n",
+                    "func=%p set_mode=%p this=%p inner=%p mode=%d (%s) "
+                    "scale=%s root=%d oct=%d setter=%p main_tid=%lu\n",
                     (void *)g_cycle_func, (void *)g_set_mode_func,
                     self, (void *)inner, mode, mode_name(mode),
+                    (g_scale_type >= 0 && g_scale_type < NUM_SCALES)
+                        ? scale_names[g_scale_type] : "?",
+                    g_root_note, g_octave_offset,
+                    (void *)g_note_setter,
                     (unsigned long)g_main_thread);
             } else {
                 rlen = snprintf(reply, sizeof reply, "no this pointer\n");
@@ -1351,6 +1615,11 @@ static void *worker(void *arg)
         LOG("no gate found to patch — test if pad perform already works");
     else
         LOG("patch failed (rc=%d)", rc);
+
+    if (install_scale_hook(&m) == 0)
+        LOG("scale-map hook active — pads remap in Pad Perform mode");
+    else
+        LOG("scale-map hook failed — note remapping unavailable");
 
     /* Find the cycling function and its this pointer for the socket trigger. */
     uintptr_t cycle = find_cycle_func(&m);
