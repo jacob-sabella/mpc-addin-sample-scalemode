@@ -7,7 +7,7 @@ docker run --rm --platform linux/arm64 -u "$(id -u):$(id -g)" -v "$PWD":/b -w /b
   set -e
   F="-std=gnu11 -O2 -Wall -Wextra -Werror"
   gcc $F -fPIC -shared -fvisibility=hidden -Wl,-z,defs -Wl,--as-needed \
-    -o build/mpc_sample_scalemode.so src/sample_scalemode.c -lpthread -ldl
+    -o build/mpc_sample_scalemode.so src/sample_scalemode.c -lpthread -ldl -lm
   strip --strip-unneeded build/mpc_sample_scalemode.so
   readelf -d build/mpc_sample_scalemode.so | grep NEEDED
   gcc $F -static -o build/padctl src/padctl.c

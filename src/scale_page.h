@@ -103,13 +103,16 @@ static void pg_render(sdc_canvas *cv)
     int sc = g_scale_type;
     if (sc < 0 || sc >= NUM_SCALES) sc = 0;
     static const char *names[] = {"C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"};
-    char root[8], line[48], smp[16];
+    char root[8], line[48], smp[24];
     snprintf(root, sizeof root, "%s", names[g_root_note % 12]);
     sdc_text(cv, 8, 28, 3, g_pg_field == 0 ? PG_PINK : PG_CYAN, scale_names[sc]);
     int x = sdc_text(cv, 8, 56, 2, g_pg_field == 1 ? PG_PINK : PG_TEXT, root);
     snprintf(line, sizeof line, "OCT %d", g_octave_offset);
     sdc_text(cv, x + 18, 56, 2, g_pg_field == 2 ? PG_PINK : PG_TEXT, line);
-    if (g_sample_root >= 0) { char nn[8]; note_name(nn, sizeof nn, g_sample_root); snprintf(smp, sizeof smp, "SAMPLE %s", nn); }
+    if (g_sample_root >= 0) {   /* "by ear": MPC had none (60), it was heard */
+        char nn[8]; note_name(nn, sizeof nn, g_sample_root);
+        snprintf(smp, sizeof smp, "SAMPLE %s%s", nn, g_sample_heard ? " BY EAR" : "");
+    }
     else snprintf(smp, sizeof smp, "SAMPLE ?");
     sdc_text(cv, x + 18 + sdc_text_width(line, 2) + 18, 60, 1, PG_DIM, smp);
     const char *state = g_scale_on ? "ON" : "OFF";
@@ -172,7 +175,7 @@ static void *page_thread(void *arg)
             cv.px = g_pg_api->pixels(g_pg, &cv.stride);
             cv.w = g_pg_api->width;
             cv.h = g_pg_api->height;
-            int sig = ((((g_scale_type * 128 + g_root_note) * 16 + g_octave_offset + 8) * 4 + g_pg_field) * 2 + g_scale_on) * 129 + g_sample_root + 1;
+            int sig = (((((g_scale_type * 128 + g_root_note) * 16 + g_octave_offset + 8) * 4 + g_pg_field) * 2 + g_scale_on) * 129 + g_sample_root + 1) * 2 + g_sample_heard;
             int lit = g_pg_hit_slot >= 0 && now - g_pg_hit_ms < 250 ? g_pg_hit_slot : -1;
             g_pg_lit = lit;
             if (!was_up || sig != last_sig) {

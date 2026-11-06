@@ -26,6 +26,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <semaphore.h>
 #include <ucontext.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -41,9 +42,10 @@ struct conf {
     int page;             /* the SCALE page on the screen (needs the draw handler addin) */
     int hold_note;        /* the button whose long hold toggles Scale: 16 Levels */
     int hold_ms;
+    int detect_pitch;     /* hear the pitch of a sample MPC has no root note for (MPC's 60) */
 };
 
-static struct conf C = { .enabled = 1, .padperform_patch = 0, .page = 1, .hold_note = 40, .hold_ms = 800 };
+static struct conf C = { .enabled = 1, .padperform_patch = 0, .page = 1, .hold_note = 40, .hold_ms = 800, .detect_pitch = 1 };
 
 static void addin_dir(char *out, size_t n)
 {
@@ -87,6 +89,7 @@ static void load_conf(void)
         else if (!strcmp(line, "page")) C.page = atoi(val);
         else if (!strcmp(line, "hold_note")) C.hold_note = atoi(val);
         else if (!strcmp(line, "hold_ms")) C.hold_ms = atoi(val) >= 200 ? atoi(val) : 200;
+        else if (!strcmp(line, "detect_pitch")) C.detect_pitch = atoi(val);
     }
     fclose(f);
 }
@@ -723,6 +726,7 @@ static int sixteen_on(void)
 }
 
 static volatile int g_sample_root;
+static volatile int g_sample_heard;
 static int slot_offset(int slot, int sample_root, int *root_off_out);
 #include "scale_page.h"
 #include "hold.h"
@@ -768,9 +772,10 @@ static int mem_ptr(uintptr_t a, uintptr_t *v) { return mem_read(a, v, 8) == 0 &&
  * 1.3.0.12): 16 Levels object +0x104 = its pad; the program (two paths from that object, checked by its 128 instruments)
  * +0x2808 = instruments[pad]; instrument +0x22e8 = layer 1, +0x4a8 = sample, +0x130 = its data, +0x3e4 = root note.
  * Every step goes through mem_read. -1 when any step fails (no sample, other firmware): then pad_root stands in. */
-static volatile int g_sample_root = -1;   /* the last one read, for the page and status */
+static volatile int g_sample_root = -1;    /* the last one used, for the page and status */
+/* g_sample_heard (declared above): 1 when g_sample_root was detected, not MPC's */
 
-static int sample_root_of(uintptr_t sixteen)
+static int mpc_root_of(uintptr_t sixteen, uintptr_t *smp_out, uintptr_t *dat_out)
 {
     static const uint16_t paths[][2] = { { 0x110, 0x110 }, { 0x10, 0x210 } };   /* to the track; +0xb8 is its program */
     int32_t pad, root;
@@ -785,7 +790,154 @@ static int sample_root_of(uintptr_t sixteen)
     if (!prog || mem_ptr(vb + (uintptr_t)pad * 8, &ins) || mem_ptr(ins + 0x22e8, &lay) || mem_ptr(lay + 0x4a8, &smp)
         || mem_ptr(smp + 0x130, &dat) || mem_read(dat + 0x3e4, &root, 4) || root < 0 || root > 127)
         return -1;
+    if (smp_out) *smp_out = smp;
+    if (dat_out) *dat_out = dat;
     return root;
+}
+
+/* ── pitch detection, for a sample MPC has no root note for ──
+ * An untagged WAV gets MPC's default root, 60, and so does one tagged 60: with detect_pitch on, a 60 is checked by ear.
+ * Where the audio is (firmware 1.3.0.12): sample +0x170 = its audio object, a MemorySample (all of it in RAM: short files,
+ * recordings) or a DiskSample (streamed from its file, only regions in use pinned in RAM), told apart by RTTI.
+ * MemorySample: +0x18 is the sample's data again (checked), +0x28 a holder of the frames, interleaved 32-bit floats; data
+ * +0x0 = channels, +0x4 = frames, +0x8 = rate, +0xc = bits (32). DiskSample: its file is read instead, the path at sample
+ * +0x120 (a JUCE File: the text). A worker thread does it (memory through mem_read: a sample freed meanwhile gives a failed
+ * read, not a crash) and keeps one result per sample; the pad hook only looks results up, and asks for one it lacks. The
+ * first hit of a new sample still plays from 60, the next from what was heard (detection takes tens of ms). */
+#include "pitch_detect.h"
+
+#define PD_SLOTS 32
+struct pd_slot { volatile uintptr_t smp; uintptr_t dat, buf; int32_t frames; int midi; float aper; };
+static struct pd_slot g_pd[PD_SLOTS];
+static volatile uintptr_t g_pd_req_smp, g_pd_req_dat;
+static sem_t g_pd_sem;
+static volatile int g_pd_ready;
+
+struct pd_src { uintptr_t buf; int ch; };
+static int pd_read(void *user, long frame, int n, float *out)
+{
+    struct pd_src *s = user;
+    static float raw[(PD_WIN + 4096) * 2];
+    if (n > PD_WIN + 4096) return -1;
+    if (mem_read(s->buf + (uintptr_t)frame * s->ch * 4, raw, (size_t)n * s->ch * 4)) return -1;
+    for (int i = 0; i < n; i++) {
+        float v = s->ch == 2 ? (raw[2 * i] + raw[2 * i + 1]) * 0.5f : raw[i];
+        out[i] = v == v && v > -8 && v < 8 ? v : 0;   /* a NaN or wild value: not audio */
+    }
+    return 0;
+}
+
+/* 1 when obj's class (by its RTTI) is name, mangled ("12MemorySample") */
+static int rtti_is(uintptr_t obj, const char *name)
+{
+    uintptr_t vt, ti, np;
+    char got[32];
+    size_t n = strlen(name) + 1;
+    if (n > sizeof got || mem_ptr(obj, &vt) || mem_ptr(vt - 8, &ti) || mem_ptr(ti + 8, &np) || mem_read(np, got, n)) return 0;
+    return !memcmp(got, name, n);
+}
+
+/* the file a sample was loaded from, or -1 */
+static int sample_path(uintptr_t smp, char *out, size_t n)
+{
+    uintptr_t p;
+    if (mem_ptr(smp + 0x120, &p)) return -1;
+    for (size_t o = 0; o + 64 <= n; o += 64) {   /* in pieces: the text may end just before an unmapped page */
+        if (mem_read(p + o, out + o, 64)) return -1;
+        if (memchr(out + o, 0, 64)) return out[0] == '/' ? 0 : -1;
+    }
+    return -1;
+}
+
+/* the frames of a MemorySample: 0 and *buf set, or -1 */
+static int sample_audio(uintptr_t smp, uintptr_t dat, uintptr_t *buf, int *ch, int32_t *frames, int *rate)
+{
+    uintptr_t y, yd, holder, b;
+    int32_t hdr[4];
+    if (mem_ptr(smp + 0x170, &y) || !rtti_is(y, "12MemorySample") || mem_ptr(y + 0x18, &yd) || yd != dat
+        || mem_ptr(y + 0x28, &holder) || mem_ptr(holder, &b))
+        return -1;
+    if (mem_read(dat, hdr, sizeof hdr) || hdr[0] < 1 || hdr[0] > 2 || hdr[1] < 1 || hdr[2] < 8000 || hdr[2] > 192000 || hdr[3] != 32)
+        return -1;
+    *buf = b; *ch = hdr[0]; *frames = hdr[1]; *rate = hdr[2];
+    return 0;
+}
+
+static struct pd_slot *pd_find(uintptr_t smp, uintptr_t dat)
+{
+    for (int i = 0; i < PD_SLOTS; i++)
+        if (g_pd[i].smp == smp && g_pd[i].dat == dat) return &g_pd[i];
+    return NULL;
+}
+
+static void *pd_worker(void *arg)
+{
+    (void)arg;
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, NULL);
+    int next = 0;
+    for (;;) {
+        while (sem_wait(&g_pd_sem) && errno == EINTR) {}
+        uintptr_t smp = g_pd_req_smp, dat = g_pd_req_dat;
+        if (!smp || pd_find(smp, dat)) continue;
+        struct pd_src src = { 0, 0 };
+        struct pd_wav w;
+        char path[1024] = "";
+        int32_t frames = 0; int rate = 0;
+        float aper = 1, midi = -1;
+        if (sample_audio(smp, dat, &src.buf, &src.ch, &frames, &rate) == 0) {
+            midi = pitch_detect(pd_read, &src, frames, rate, &aper);
+        } else if (sample_path(smp, path, sizeof path) == 0 && pd_wav_open(path, &w) == 0) {
+            frames = (int32_t)w.frames; rate = w.rate;
+            midi = pitch_detect(pd_wav_read, &w, w.frames, w.rate, &aper);
+            close(w.fd);
+        } else {   /* neither readable (yet), or not a WAV: asked again on the next hit */
+            LOG("pitch: sample %#lx: no audio to read%s%s", (unsigned long)smp, path[0] ? " in " : "", path);
+            g_pd_req_smp = 0;
+            continue;
+        }
+        struct pd_slot *s = &g_pd[next];
+        next = (next + 1) % PD_SLOTS;
+        s->smp = 0;
+        __sync_synchronize();
+        s->dat = dat; s->buf = src.buf; s->frames = frames; s->aper = aper;
+        s->midi = midi >= 0 ? (int)lrintf(midi) : -1;
+        if (s->midi > 127) s->midi = -1;
+        __sync_synchronize();
+        s->smp = smp;
+        LOG("pitch: sample %#lx (%d frames, %d Hz, %s): %s%.2f (aperiodicity %.3f)", (unsigned long)smp, frames, rate,
+            path[0] ? "its file" : "memory", midi >= 0 ? "" : "none, ", midi, aper);
+    }
+    return NULL;
+}
+
+static void pd_start(void)
+{
+    if (sem_init(&g_pd_sem, 0, 0)) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, pd_worker, NULL) == 0) { pthread_detach(t); g_pd_ready = 1; }
+}
+
+/* The sample's root for the scale: MPC's, or for a 60 what was heard (asked for when it isn't known yet). */
+static int sample_root_of(uintptr_t sixteen, int *heard)
+{
+    uintptr_t smp = 0, dat = 0;
+    int root = mpc_root_of(sixteen, &smp, &dat);
+    if (heard) *heard = 0;
+    if (root != 60 || !C.detect_pitch || !g_pd_ready) return root;
+    struct pd_slot *s = pd_find(smp, dat);
+    if (!s) {
+        if (g_pd_req_smp != smp || g_pd_req_dat != dat) {
+            g_pd_req_dat = dat;
+            g_pd_req_smp = smp;
+            sem_post(&g_pd_sem);
+        }
+        return root;
+    }
+    if (s->midi < 0) return root;
+    if (heard) *heard = 1;
+    return s->midi;
 }
 
 /* Semitones from the sample's own pitch for a slot: the scale from the chosen root, by note name (the sample's octave is
@@ -809,6 +961,7 @@ static void *volatile g_last_ctx;   /* the 16 Levels object of the last pad hit 
 static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
 {
     g_last_ctx = ctx;
+    if (!g_scale_on && C.detect_pitch) sample_root_of((uintptr_t)ctx, NULL);   /* hear it now, before Scale goes on */
     int hits = __sync_add_and_fetch(&g_hook_hits, 1);
     if (hits <= 16 || (hits & 0xFF) == 0)
         LOG("hook[%d]: type=%d scale_on=%d pad_val=0x%lx",
@@ -817,8 +970,9 @@ static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
     if (!g_scale_on) return 0;
 
     int pad = (int)(pad_val & 0xF);
-    int sroot = sample_root_of((uintptr_t)ctx);   /* ctx: the 16 Levels object */
+    int heard, sroot = sample_root_of((uintptr_t)ctx, &heard);   /* ctx: the 16 Levels object */
     g_sample_root = sroot;
+    g_sample_heard = heard;
     int root_off;
     int note = slot_offset(pad, sroot, &root_off);
 
@@ -1723,11 +1877,13 @@ static void *socket_worker(void *arg)
             int pad = (!strncmp(buf, "testmap ", 8)) ? atoi(buf + 8) : 0;
             if (pad < 0) pad = 0;
             if (pad > 15) pad = 15;
-            int ro, sroot = g_last_ctx ? sample_root_of((uintptr_t)g_last_ctx) : -1;
+            int ro, heard = 0, sroot = g_last_ctx ? sample_root_of((uintptr_t)g_last_ctx, &heard) : -1;
+            int mroot = g_last_ctx ? mpc_root_of((uintptr_t)g_last_ctx, NULL, NULL) : -1;
             int note = slot_offset(pad, sroot, &ro);
             char reply[256];
-            int rlen = snprintf(reply, sizeof reply, "pad=%d scale=%s sample_root=%d root_off=%d -> offset %d\n",
-                pad, scale_names[g_scale_type >= 0 && g_scale_type < NUM_SCALES ? g_scale_type : 0], sroot, ro, note);
+            int rlen = snprintf(reply, sizeof reply, "pad=%d scale=%s sample_root=%d%s mpc_root=%d root_off=%d -> offset %d\n",
+                pad, scale_names[g_scale_type >= 0 && g_scale_type < NUM_SCALES ? g_scale_type : 0], sroot,
+                heard ? " (heard)" : "", mroot, ro, note);
             write(c, reply, rlen);
 
         } else if (!strncmp(buf, "note ", 5)) {
@@ -1781,6 +1937,21 @@ static void *socket_worker(void *arg)
                 if (page) g_pg_want = 1;
                 snprintf(reply, sizeof reply, "lat %s: %d hits every %d ms\n", what, n, per);
             }
+            write(c, reply, strlen(reply));
+        } else if (!strcmp(buf, "hear")) {
+            /* hear: the pitch heard in the last pad's sample, whatever MPC's root for it (detected now if not yet) */
+            char reply[200]; uintptr_t smp = 0, dat = 0;
+            int mroot = g_last_ctx ? mpc_root_of((uintptr_t)g_last_ctx, &smp, &dat) : -1;
+            struct pd_slot *ps = NULL;
+            if (mroot >= 0 && g_pd_ready) {
+                ps = pd_find(smp, dat);
+                if (!ps) { g_pd_req_dat = dat; g_pd_req_smp = smp; sem_post(&g_pd_sem); }
+                for (int i = 0; i < 40 && !ps; i++) { usleep(50000); ps = pd_find(smp, dat); }
+            }
+            if (mroot < 0) snprintf(reply, sizeof reply, "no sample (play a pad in 16 Levels first)\n");
+            else if (!ps) snprintf(reply, sizeof reply, "mpc_root=%d heard=? (audio not readable)\n", mroot);
+            else snprintf(reply, sizeof reply, "mpc_root=%d heard=%d aperiodicity=%.3f frames=%d used=%s\n", mroot, ps->midi,
+                          ps->aper, ps->frames, mroot == 60 && C.detect_pitch && ps->midi >= 0 ? "heard" : "mpc");
             write(c, reply, strlen(reply));
         } else if (!strcmp(buf, "leds")) {
             char reply[600];
@@ -1885,6 +2056,7 @@ static void *worker(void *arg)
     else
         LOG("scale-map hook failed — note remapping unavailable");
 
+    pd_start();
     if (C.page) page_start();
     hold_start();
 

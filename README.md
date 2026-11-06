@@ -65,6 +65,7 @@ hold_ms=800        # how long a hold of 16 Levels toggles Scale (at least 200)
 page=1             # 0: no SCALE page
 padperform_patch=0 # 1 forces the PadPerform bool (blocks 16 Levels)
 pad_root=60        # only when MPC's root note for the sample can't be read (see below)
+detect_pitch=1     # 0: take MPC's 60 as is, don't listen for the note of an untagged sample
 ```
 
 **The sample's own note.** Scale reads the root note MPC keeps for the sample
@@ -75,6 +76,16 @@ moves everything by octaves. The page shows it as SAMPLE. A sample tagged with
 the wrong note plays the scale that far off, as it would in a keygroup: one Moog
 lead here sounds C# but its file says D. When the note can't be read (other
 firmware), `pad_root` stands in.
+
+**Untagged samples are listened to.** A WAV with no note in it gets MPC's
+default, 60, and so the addin checks every 60 by ear: in the background it reads
+the sample's audio (from memory, or from its WAV file when MPC streams it from
+disk), finds its pitch, and uses that note instead. The page then shows
+SAMPLE <note> BY EAR. A sample with no clear pitch (most drums, noise, dense
+chords) keeps 60, and a drum with a tuned tail, like an 808 kick, gets the
+tail's note. The first hit of a new sample still plays from 60; the
+detection takes tens of milliseconds, and every hit after it uses the note
+heard. `padctl hear` shows what the addin hears in the last sample played.
 
 The page and `padctl` rewrite `scale`, `root` and `octave_offset` in place and
 keep the rest of the file.
@@ -88,6 +99,7 @@ padctl root A2         # change root note
 padctl octave -1       # octave offset
 padctl page            # open the SCALE page
 padctl testmap 0       # dry run: what pad 0 would play
+padctl hear            # the pitch heard in the last sample played, beside MPC's root note
 padctl hookhits        # how many times the note hook has fired
 padctl note <ch> <note> [vel] [hold ms]   # inject a control-surface press (testing)
 padctl on|off <ch> <note> [vel]           # one half of a press, for combinations
@@ -97,6 +109,9 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
 ## Testing
 
 - `tests/hold_test.c`: host test of the 16 Levels hold filter (`gcc -fsanitize=address,undefined`).
+- `tests/pitch_detect_test.c`: host test of the pitch detection on made-up sounds (pitched ones from E1 to C7,
+  noise and a snare that have none), plus any WAV files given with the note they should read:
+  `cc -O2 -o /tmp/pdt tests/pitch_detect_test.c -lm && /tmp/pdt lead.wav=61 hat.wav=none`.
 - `tests/device_test.sh`: the whole sequence on a Sample over SSH, no hands on the
   device. Button and pad presses go in with `padctl note/on/off`, the screen comes
   back through the draw handler's `/snap`, and the page frames come out as a GIF.
@@ -116,8 +131,11 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
   sample, so Scale repitches the sample already on the pad.
 - **Reinstall after a reboot.** On the Sample the shared installer puts the
   `LD_PRELOAD` drop-in on `/run`, which is tmpfs; the installer says so.
-- **The sample's note is MPC's.** Scale doesn't measure the audio; a wrong or
-  missing root note in the file (an untagged sample reads as C) moves the scale with it.
+- **A tagged note is trusted.** Only MPC's 60 (untagged, or tagged 60) is checked by
+  ear; any other note is used as MPC has it, even when the file's tag is wrong.
+- **By ear, WAV files only from disk.** A sample MPC streams from a file that isn't a
+  WAV (16, 24 or 32-bit PCM, or 32-bit float) keeps 60. Short samples and recordings,
+  which MPC holds in memory, are read there whatever their file.
 - **Type names not mapped.** `padctl status` prints the native Type as a number (0-2).
 
 ## How it works
@@ -132,9 +150,13 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
    the sample's root note (16 Levels pad -> program -> instrument -> layer ->
    sample, each pointer read through `/proc/self/mem`, so a wrong one fails
    instead of crashing MPC).
-4. The SCALE page is a draw handler client: it takes the screen when Scale
+4. For a sample at 60, a worker thread reads its audio (the sample's audio object
+   is a `MemorySample` or a `DiskSample`, told apart by its RTTI; the second is read
+   from its file), runs YIN on a few windows past the attack (`src/pitch_detect.h`),
+   and keeps the result per sample.
+5. The SCALE page is a draw handler client: it takes the screen when Scale
    toggles and gives it back when idle.
-5. A socket server on `/tmp/padmode.sock` accepts `padctl` commands.
+6. A socket server on `/tmp/padmode.sock` accepts `padctl` commands.
 
 ## License
 
