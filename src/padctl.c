@@ -25,9 +25,9 @@ int main(int argc, char **argv) {
     }
     write(fd, cmd, strlen(cmd));
     shutdown(fd, SHUT_WR);
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    if (n > 0) { buf[n] = 0; printf("%s", buf); }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, stdout);   /* the whole reply (leds, peek are long) */
     close(fd);
     return 0;
 }
