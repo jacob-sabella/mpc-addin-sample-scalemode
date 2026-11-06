@@ -63,6 +63,13 @@ int main(void)
     unsigned char raw[3] = { 0x90, 40, 0x7f };
     CHECK(hold_filter(7, raw, 3) == 3);
 
+    /* test input: queued as a frame for the surface fd, and poll is told */
+    CHECK(hold_inject(0x99, 37, 100) == -1);   /* no surface seen yet */
+    g_surface_fd = 7;
+    CHECK(hold_inject(0x99, 37, 100) == 0 && g_inj_n == 1 && hold_pending() == 7);
+    CHECK(g_inj[g_inj_head][1] == 3 && g_inj[g_inj_head][HOLD_DATA] == 0x99 && g_inj[g_inj_head][HOLD_DATA + 1] == 37);
+    struct pollfd pf = { 7, POLLIN, 0 };
+    CHECK(hold_watches(&pf, 1) && hold_mark(&pf, 1, 0) == 1 && (pf.revents & POLLIN));
     (void)hold_start;
     printf(fails ? "hold_test: %d failed\n" : "hold_test: ok\n", fails);
     return fails != 0;

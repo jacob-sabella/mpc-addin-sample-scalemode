@@ -985,7 +985,14 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
         g_pending_setmode = -1;
     }
 
-    return hold_mark(fds, nfds, real_poll(fds, nfds, hold_pending() >= 0 ? 0 : timeout));
+    if (hold_pending() >= 0 || !hold_watches(fds, nfds))
+        return hold_mark(fds, nfds, real_poll(fds, nfds, hold_pending() >= 0 ? 0 : timeout));
+    for (int left = timeout;;) {   /* slices, so a queued test frame wakes the wait */
+        int slice = left < 0 || left > 20 ? 20 : left;
+        int r = real_poll(fds, nfds, slice);
+        if (r != 0 || hold_pending() >= 0 || left == slice) return hold_mark(fds, nfds, r);
+        if (left > 0) left -= slice;
+    }
 }
 
 static int find_this_pointer(struct mpc_mapping *m, uintptr_t cycle_func)
@@ -1659,6 +1666,31 @@ static void *socket_worker(void *arg)
                 pad, scale_names[sc], degree, interval, octave, ro, note);
             write(c, reply, rlen);
 
+        } else if (!strncmp(buf, "note ", 5)) {
+            /* note <ch 1-16> <note> <velocity> <hold ms>: a press, then its release */
+            int ch = 0, nt = -1, vel = 100, ms = 100;
+            char reply[96];
+            if (sscanf(buf + 5, "%d %d %d %d", &ch, &nt, &vel, &ms) < 2 || ch < 1 || ch > 16 || nt < 0 || nt > 127) {
+                snprintf(reply, sizeof reply, "usage: note <ch 1-16> <note> [velocity] [hold ms]\n");
+            } else if (hold_inject(0x90 | (ch - 1), nt, vel) != 0) {
+                snprintf(reply, sizeof reply, "control surface not seen yet\n");
+            } else {
+                usleep((useconds_t)(ms > 0 ? ms : 1) * 1000u);
+                hold_inject(0x80 | (ch - 1), nt, 0);
+                snprintf(reply, sizeof reply, "note ch%d %d vel %d held %d ms\n", ch, nt, vel, ms);
+            }
+            write(c, reply, strlen(reply));
+        } else if (!strncmp(buf, "on ", 3) || !strncmp(buf, "off ", 4)) {
+            /* on|off <ch 1-16> <note> [velocity]: one half of a press, for combinations (Shift held while ...) */
+            int on = buf[1] == 'n', ch = 0, nt = -1, vel = 100;
+            char reply[80];
+            if (sscanf(buf + (on ? 3 : 4), "%d %d %d", &ch, &nt, &vel) < 2 || ch < 1 || ch > 16 || nt < 0 || nt > 127)
+                snprintf(reply, sizeof reply, "usage: on|off <ch 1-16> <note> [velocity]\n");
+            else if (hold_inject((on ? 0x90 : 0x80) | (ch - 1), nt, on ? vel : 0) != 0)
+                snprintf(reply, sizeof reply, "control surface not seen yet\n");
+            else
+                snprintf(reply, sizeof reply, "%s ch%d %d\n", on ? "on" : "off", ch, nt);
+            write(c, reply, strlen(reply));
         } else if (!strcmp(buf, "page")) {
             page_popup();
             const char *r = g_pg ? "page: opening\n" : "page: no SCALE page (draw handler missing?)\n";

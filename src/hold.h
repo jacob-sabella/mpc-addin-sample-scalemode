@@ -27,6 +27,12 @@ static int g_hold_held, g_hold_fired, g_shift_down;
 static long long g_hold_since;
 static volatile int g_hold_on;
 
+/* Test input (padctl press/pad/note): frames queued for MPC's next read of the control surface, filtered like real ones. */
+static unsigned char g_inj[64][HOLD_FRAME];
+static int g_inj_head, g_inj_n;
+static volatile int g_surface_fd = -1;
+static int g_pad_log = 32;   /* the first channel-10 messages (the pads) are logged, to learn their notes */
+
 static long long hold_now_ms(void)
 {
     struct timespec t;
@@ -44,6 +50,7 @@ static int hold_is_surface(int fd)
     if (n <= 0) return 0;
     t[n] = 0;
     g_hold_cls[fd] = strstr(t, "/dev/snd/midiC0D0") ? 1 : 2;
+    if (g_hold_cls[fd] == 1) g_surface_fd = fd;
     return g_hold_cls[fd] == 1;
 }
 
@@ -62,6 +69,10 @@ static ssize_t hold_filter(int fd, unsigned char *b, ssize_t n)
     ssize_t o = 0;
     for (ssize_t f = 0; f + HOLD_FRAME <= n; f += HOLD_FRAME) {
         unsigned char *fr = b + f, *d = fr + HOLD_DATA;
+        if (g_pad_log > 0 && (d[0] & 15) == 9) {
+            g_pad_log--;
+            LOG("ch10: %02x %02x %02x (len %d)", d[0], d[1], d[2], fr[1]);
+        }
         if (fr[1] == 3 && (d[0] == 0x90 || d[0] == 0x80)) {
             int down = d[0] == 0x90 && d[2];
             if (d[1] == SHIFT_NOTE) g_shift_down = down;
@@ -103,6 +114,14 @@ __attribute__((visibility("default"))) ssize_t read(int fd, void *buf, size_t n)
             pthread_mutex_unlock(&g_hold_mu);
             return (ssize_t)k;
         }
+        if (g_inj_n && n >= HOLD_FRAME) {   /* a test frame, as if it had just arrived */
+            memcpy(buf, g_inj[g_inj_head], HOLD_FRAME);
+            g_inj_head = (g_inj_head + 1) % 64; g_inj_n--;
+            ssize_t k = hold_filter(fd, buf, HOLD_FRAME);
+            pthread_mutex_unlock(&g_hold_mu);
+            if (k > 0) return k;
+            continue;
+        }
         pthread_mutex_unlock(&g_hold_mu);
         ssize_t r = real_read(fd, buf, n);
         if (r <= 0) return r;
@@ -125,9 +144,35 @@ __attribute__((visibility("default"))) int close(int fd)
 static int hold_pending(void)
 {
     pthread_mutex_lock(&g_hold_mu);
-    int fd = g_hold_npend ? g_hold_pend_fd : -1;
+    int fd = g_hold_npend ? g_hold_pend_fd : g_inj_n ? g_surface_fd : -1;
     pthread_mutex_unlock(&g_hold_mu);
     return fd;
+}
+
+/* The call waits for input on the control surface (once MPC has read from it). */
+static int hold_watches(const struct pollfd *fds, nfds_t nf)
+{
+    int sfd = g_surface_fd;
+    if (sfd < 0) return 0;
+    for (nfds_t i = 0; i < nf; i++) if (fds[i].fd == sfd && (fds[i].events & POLLIN)) return 1;
+    return 0;
+}
+
+/* Queue a test message: 3 MIDI bytes in a frame of their own. 0, or -1 (MPC hasn't read the surface yet, or full). */
+static int hold_inject(int st, int d1, int d2)
+{
+    if (g_surface_fd < 0) return -1;
+    pthread_mutex_lock(&g_hold_mu);
+    int ok = g_inj_n < 64;
+    if (ok) {
+        unsigned char *f = g_inj[(g_inj_head + g_inj_n) % 64];
+        memset(f, 0, HOLD_FRAME);
+        f[1] = 3;
+        f[HOLD_DATA] = (unsigned char)st; f[HOLD_DATA + 1] = (unsigned char)d1; f[HOLD_DATA + 2] = (unsigned char)d2;
+        g_inj_n++;
+    }
+    pthread_mutex_unlock(&g_hold_mu);
+    return ok ? 0 : -1;
 }
 
 /* A held-back release makes its fd readable. */
@@ -151,7 +196,16 @@ __attribute__((visibility("default"))) int ppoll(struct pollfd *fds, nfds_t nf, 
         real_ppoll = (int (*)(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *))dlsym(RTLD_NEXT, "ppoll");
     struct timespec zero = { 0, 0 };
     if (hold_pending() >= 0) ts = &zero;
-    return hold_mark(fds, nf, real_ppoll(fds, nf, ts, ss));
+    if (!hold_watches(fds, nf)) return hold_mark(fds, nf, real_ppoll(fds, nf, ts, ss));
+    /* waits on the control surface in slices, so a queued test frame wakes it */
+    long long left = ts ? ts->tv_sec * 1000LL + ts->tv_nsec / 1000000 : -1;
+    for (;;) {
+        long long slice = left < 0 || left > 20 ? 20 : left;
+        struct timespec st = { 0, (long)slice * 1000000L };
+        int r = real_ppoll(fds, nf, &st, ss);
+        if (r != 0 || hold_pending() >= 0 || left == slice) return hold_mark(fds, nf, r);
+        if (left > 0) left -= slice;
+    }
 }
 
 static void *hold_thread(void *arg)
