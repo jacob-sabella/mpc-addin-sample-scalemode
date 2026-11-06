@@ -59,6 +59,11 @@ padctl hookhits     # how many times the hook has fired
 
 ## Known limitations
 
+- **Pads need samples.** The firmware skips the note mapping function entirely
+  for pads that have no sample assigned. Scale Mode repitches whatever sample
+  is already on the pad — it doesn't create sound from nothing. Load a drum
+  program where every pad in the active bank has a sample, or duplicate a
+  single sample across all pads for a melodic layout.
 - **No on-screen scale UI.** The Sample's 320x240 non-touch screen has no
   built-in Pad Perform settings dialogue. Use `padctl` over SSH or edit the
   conf file for settings. The pad mode indicator (Full Level / 16 Level /
