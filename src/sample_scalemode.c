@@ -42,7 +42,7 @@ struct conf {
     int page;             /* the SCALE page on the screen (needs the draw handler addin) */
     int hold_note;        /* the button whose long hold toggles Scale: 16 Levels */
     int hold_ms;
-    int detect_pitch;     /* hear the pitch of a sample MPC has no root note for (MPC's 60) */
+    int detect_pitch;     /* 0 off, 1 hear a sample MPC has no root note for (MPC's 60), 2 hear every sample */
 };
 
 static struct conf C = { .enabled = 1, .padperform_patch = 0, .page = 1, .hold_note = 40, .hold_ms = 800, .detect_pitch = 1 };
@@ -68,6 +68,15 @@ static void addin_dir(char *out, size_t n)
     fclose(f);
 }
 
+/* detect_pitch: 0|off, 1|untagged, 2|always; anything else is the default, 1 */
+static int parse_detect(const char *v)
+{
+    if (!strcasecmp(v, "off") || !strcmp(v, "0")) return 0;
+    if (!strcasecmp(v, "always") || !strcmp(v, "2")) return 2;
+    return 1;
+}
+static const char *detect_name(int d) { return d == 0 ? "off" : d == 2 ? "always" : "untagged"; }
+
 static void load_conf(void)
 {
     char dir[256], path[512];
@@ -89,7 +98,7 @@ static void load_conf(void)
         else if (!strcmp(line, "page")) C.page = atoi(val);
         else if (!strcmp(line, "hold_note")) C.hold_note = atoi(val);
         else if (!strcmp(line, "hold_ms")) C.hold_ms = atoi(val) >= 200 ? atoi(val) : 200;
-        else if (!strcmp(line, "detect_pitch")) C.detect_pitch = atoi(val);
+        else if (!strcmp(line, "detect_pitch")) C.detect_pitch = parse_detect(val);
     }
     fclose(f);
 }
@@ -678,7 +687,7 @@ static void load_scale_conf(void)
         scale_names[g_scale_type], g_root_note, g_pad_root, g_octave_offset);
 }
 
-/* Rewrites the four keys the page and padctl change, in place; every other line (comments, hold_ms, page...) is kept. */
+/* Rewrites the keys the page and padctl change, in place; every other line (comments, hold_ms, page...) is kept. */
 static void save_conf(void)
 {
     char dir[256], path[512], tmp[520];
@@ -686,19 +695,20 @@ static void save_conf(void)
     if (!dir[0]) return;
     snprintf(path, sizeof path, "%s/mpc_sample_scalemode.conf", dir);
     snprintf(tmp, sizeof tmp, "%s.new", path);
-    static const char *keys[4] = {"scale", "root", "octave_offset", "pad_root"};
-    char vals[4][48];
+    static const char *keys[5] = {"scale", "root", "octave_offset", "pad_root", "detect_pitch"};
+    char vals[5][48];
     snprintf(vals[0], sizeof vals[0], "%s", scale_names[g_scale_type]);
     snprintf(vals[1], sizeof vals[1], "%d", g_root_note);
     snprintf(vals[2], sizeof vals[2], "%d", g_octave_offset);
     snprintf(vals[3], sizeof vals[3], "%d", g_pad_root);
-    int done[4] = {0, 0, 0, g_pad_root == 60};   /* pad_root is only added when it isn't the default */
+    snprintf(vals[4], sizeof vals[4], "%s", detect_name(C.detect_pitch));
+    int done[5] = {0, 0, 0, g_pad_root == 60, C.detect_pitch == 1};   /* pad_root, detect_pitch: only added when not the default */
     FILE *in = fopen(path, "re"), *f = fopen(tmp, "we");
     if (!f) { if (in) fclose(in); return; }
     char line[256];
     while (in && fgets(line, sizeof line, in)) {
         int k = -1;
-        for (int i = 0; i < 4 && k < 0; i++) {
+        for (int i = 0; i < 5 && k < 0; i++) {
             size_t n = strlen(keys[i]);
             if (!strncmp(line, keys[i], n) && line[n] == '=') k = i;
         }
@@ -707,7 +717,7 @@ static void save_conf(void)
         done[k] = 1;
     }
     if (in) fclose(in);
-    for (int i = 0; i < 4; i++) if (!done[i]) fprintf(f, "%s=%s\n", keys[i], vals[i]);
+    for (int i = 0; i < 5; i++) if (!done[i]) fprintf(f, "%s=%s\n", keys[i], vals[i]);
     fclose(f);
     rename(tmp, path);
 }
@@ -796,7 +806,8 @@ static int mpc_root_of(uintptr_t sixteen, uintptr_t *smp_out, uintptr_t *dat_out
 }
 
 /* ── pitch detection, for a sample MPC has no root note for ──
- * An untagged WAV gets MPC's default root, 60, and so does one tagged 60: with detect_pitch on, a 60 is checked by ear.
+ * An untagged WAV gets MPC's default root, 60, and so does one tagged 60: with detect_pitch untagged (the default), a 60 is
+ * checked by ear; with always, every sample is (for files tagged with the wrong note). No clear pitch: MPC's root stands.
  * Where the audio is (firmware 1.3.0.12): sample +0x170 = its audio object, a MemorySample (all of it in RAM: short files,
  * recordings) or a DiskSample (streamed from its file, only regions in use pinned in RAM), told apart by RTTI.
  * MemorySample: +0x18 is the sample's data again (checked), +0x28 a holder of the frames, interleaved 32-bit floats; data
@@ -925,7 +936,7 @@ static int sample_root_of(uintptr_t sixteen, int *heard)
     uintptr_t smp = 0, dat = 0;
     int root = mpc_root_of(sixteen, &smp, &dat);
     if (heard) *heard = 0;
-    if (root != 60 || !C.detect_pitch || !g_pd_ready) return root;
+    if (root < 0 || !C.detect_pitch || (root != 60 && C.detect_pitch != 2) || !g_pd_ready) return root;
     struct pd_slot *s = pd_find(smp, dat);
     if (!s) {
         if (g_pd_req_smp != smp || g_pd_req_dat != dat) {
@@ -1873,6 +1884,13 @@ static void *socket_worker(void *arg)
             int rlen = snprintf(reply, sizeof reply, "octave_offset=%d\n", oct);
             write(c, reply, rlen);
 
+        } else if (!strncmp(buf, "detect", 6) && (buf[6] == ' ' || !buf[6])) {
+            /* detect [off|untagged|always]: when a sample's pitch is heard instead of MPC's root (saved to the conf) */
+            if (buf[6] == ' ') { C.detect_pitch = parse_detect(buf + 7); save_conf(); }
+            char reply[64];
+            int rlen = snprintf(reply, sizeof reply, "detect_pitch=%s\n", detect_name(C.detect_pitch));
+            write(c, reply, rlen);
+
         } else if (!strncmp(buf, "testmap ", 8) || !strcmp(buf, "testmap")) {
             int pad = (!strncmp(buf, "testmap ", 8)) ? atoi(buf + 8) : 0;
             if (pad < 0) pad = 0;
@@ -1951,7 +1969,7 @@ static void *socket_worker(void *arg)
             if (mroot < 0) snprintf(reply, sizeof reply, "no sample (play a pad in 16 Levels first)\n");
             else if (!ps) snprintf(reply, sizeof reply, "mpc_root=%d heard=? (audio not readable)\n", mroot);
             else snprintf(reply, sizeof reply, "mpc_root=%d heard=%d aperiodicity=%.3f frames=%d used=%s\n", mroot, ps->midi,
-                          ps->aper, ps->frames, mroot == 60 && C.detect_pitch && ps->midi >= 0 ? "heard" : "mpc");
+                          ps->aper, ps->frames, ps->midi >= 0 && C.detect_pitch && (mroot == 60 || C.detect_pitch == 2) ? "heard" : "mpc");
             write(c, reply, strlen(reply));
         } else if (!strcmp(buf, "leds")) {
             char reply[600];

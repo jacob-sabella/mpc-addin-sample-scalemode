@@ -65,7 +65,7 @@ hold_ms=800        # how long a hold of 16 Levels toggles Scale (at least 200)
 page=1             # 0: no SCALE page
 padperform_patch=0 # 1 forces the PadPerform bool (blocks 16 Levels)
 pad_root=60        # only when MPC's root note for the sample can't be read (see below)
-detect_pitch=1     # 0: take MPC's 60 as is, don't listen for the note of an untagged sample
+detect_pitch=untagged # untagged: hear samples at MPC's 60; always: hear every sample; off
 ```
 
 **The sample's own note.** Scale reads the root note MPC keeps for the sample
@@ -87,6 +87,11 @@ tail's note. The first hit of a new sample still plays from 60; the
 detection takes tens of milliseconds, and every hit after it uses the note
 heard. `padctl hear` shows what the addin hears in the last sample played.
 
+**Always by ear.** A file tagged with the wrong note (the Moog lead above) plays the
+scale that far off. With `detect_pitch=always`, or `padctl detect always`, every
+sample is listened to and the note heard wins over the tag; a sample with no clear
+pitch still keeps MPC's root. `padctl detect untagged` goes back to the default.
+
 The page and `padctl` rewrite `scale`, `root` and `octave_offset` in place and
 keep the rest of the file.
 
@@ -100,6 +105,7 @@ padctl octave -1       # octave offset
 padctl page            # open the SCALE page
 padctl testmap 0       # dry run: what pad 0 would play
 padctl hear            # the pitch heard in the last sample played, beside MPC's root note
+padctl detect always   # when to go by ear: untagged (default), always or off (saved)
 padctl hookhits        # how many times the note hook has fired
 padctl note <ch> <note> [vel] [hold ms]   # inject a control-surface press (testing)
 padctl on|off <ch> <note> [vel]           # one half of a press, for combinations
@@ -131,8 +137,8 @@ padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or th
   sample, so Scale repitches the sample already on the pad.
 - **Reinstall after a reboot.** On the Sample the shared installer puts the
   `LD_PRELOAD` drop-in on `/run`, which is tmpfs; the installer says so.
-- **A tagged note is trusted.** Only MPC's 60 (untagged, or tagged 60) is checked by
-  ear; any other note is used as MPC has it, even when the file's tag is wrong.
+- **A tagged note is trusted by default.** Only MPC's 60 (untagged, or tagged 60) is
+  checked by ear unless `detect_pitch=always`.
 - **By ear, WAV files only from disk.** A sample MPC streams from a file that isn't a
   WAV (16, 24 or 32-bit PCM, or 32-bit float) keeps 60. Short samples and recordings,
   which MPC holds in memory, are read there whatever their file.

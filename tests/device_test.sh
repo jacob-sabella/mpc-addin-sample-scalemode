@@ -57,6 +57,11 @@ sr=$(pc status | sed -n 's/.*sample_root=\([-0-9]*\).*/\1/p')
 [ -n "$sr" ] && [ "$sr" -ge 0 ] && ok "reads the sample's root note ($sr)" || bad "sample root note not read (${sr:-none})"
 hr=$(pc hear)
 grep -q 'heard=-\{0,1\}[0-9]' <<<"$hr" && ok "reads the sample's audio for its pitch ($hr)" || bad "sample audio not read ($hr)"
+d0=$(pc detect | sed 's/.*=//')
+pc detect always >/dev/null; ha=$(pc hear); pc detect off >/dev/null; ho=$(pc hear); pc detect "$d0" >/dev/null
+if grep -q 'heard=-1' <<<"$ha" || { grep -q 'used=heard' <<<"$ha" && grep -q 'used=mpc' <<<"$ho"; }; then
+    ok "padctl detect always/off switch the note heard on and off (back to $(pc detect | sed 's/.*=//'))"
+else bad "padctl detect ($ha / $ho)"; fi
 
 dev "rm -rf /tmp/scaletest; mkdir -p /tmp/scaletest; cd /tmp/scaletest
      ( for i in \$(seq 1 6); do for n in $PADS; do $P note 10 \$n 110 60 >/dev/null; sleep 0.2; done; done ) &
