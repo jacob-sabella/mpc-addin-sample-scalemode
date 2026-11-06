@@ -2,5 +2,5 @@ ADDIN_ID=enable-scalemode
 ADDIN_NAME="Enable Scale Mode"
 ADDIN_SO=mpc_enable_scalemode.so
 ADDIN_CONF=mpc_enable_scalemode.conf
-ADDIN_FILES=""
-ADDIN_DONE="Pad Perform / Scale Mode is now enabled. Cycle pad modes: echo cycle | nc -U /tmp/padmode.sock   Check status: echo status | nc -U /tmp/padmode.sock"
+ADDIN_FILES="padctl"
+ADDIN_DONE="Scale Mode enabled. Cycle: padctl cycle  Set mode: padctl setmode 1  Status: padctl status"

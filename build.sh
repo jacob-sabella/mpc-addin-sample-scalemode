@@ -10,6 +10,8 @@ docker run --rm --platform linux/arm64 -u "$(id -u):$(id -g)" -v "$PWD":/b -w /b
     -o build/mpc_enable_scalemode.so src/enable_scalemode.c -lpthread -ldl
   strip --strip-unneeded build/mpc_enable_scalemode.so
   readelf -d build/mpc_enable_scalemode.so | grep NEEDED
+  gcc $F -static -o build/padctl src/padctl.c
+  strip build/padctl
 '
 cp -f mpc_enable_scalemode.conf addin.manifest build/
-ls -l build/mpc_enable_scalemode.so
+ls -l build/mpc_enable_scalemode.so build/padctl
