@@ -1749,42 +1749,25 @@ static void *worker(void *arg)
 
     load_scale_conf();
 
+    /* Before hooking: the search reads the cycle function's own code. */
+    uintptr_t cycle = find_cycle_func(&m);
+
     if (install_scale_hook(&m) == 0)
         LOG("scale-map hook active — pads remap when Scale is the 16 Levels Type");
     else
         LOG("scale-map hook failed — note remapping unavailable");
 
-    /* Find the cycling function and its this pointer for the socket trigger. */
-    uintptr_t cycle = find_cycle_func(&m);
-    if (cycle) {
-        g_cycle_func = cycle;
-        if (find_this_pointer(&m, cycle) != 0) {
-            /* The object might not be constructed yet.  Retry at
-             * increasing intervals: the MPC takes several seconds to
-             * finish initialising its control-surface objects. */
-            static const unsigned delays_ms[] = { 5000, 10000, 20000 };
-            for (unsigned i = 0; i < sizeof delays_ms / sizeof *delays_ms; i++) {
-                if (resolve_this_ptr()) break;
-                LOG("retrying this-pointer scan in %u ms", delays_ms[i]);
-                usleep(delays_ms[i] * 1000u);
-                m = find_mpc();
-                if (m.base && m.text_start)
-                    find_this_pointer(&m, cycle);
-            }
-        }
-    }
+    g_cycle_func = cycle;
+    pthread_t stid;
+    if (pthread_create(&stid, NULL, socket_worker, NULL) == 0)
+        pthread_detach(stid);
 
-    if (resolve_this_ptr())
-        LOG("this pointer resolved — socket cycle command ready");
-    else if (g_cycle_func)
-        LOG("this pointer NOT found — cycle command unavailable, try MIDI injection");
-
-    /* Start socket listener if we have at least the function address. */
-    if (g_cycle_func) {
-        pthread_t stid;
-        if (pthread_create(&stid, NULL, socket_worker, NULL) == 0)
-            pthread_detach(stid);
-    }
+    /* Optional: lets padctl step the Type before the first Shift+16 Levels
+     * press, which hands the controller to the type-cycle hook anyway. */
+    if (cycle && find_this_pointer(&m, cycle) == 0 && resolve_this_ptr())
+        LOG("this pointer resolved by scan");
+    else if (!g_type_ctl)
+        LOG("this pointer not found by scan — press Shift+16 Levels once for padctl cycle");
 
     return NULL;
 }
