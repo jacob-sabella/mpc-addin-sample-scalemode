@@ -602,7 +602,7 @@ static const char *scale_names[] = {
 
 static volatile int g_scale_type    = 5;  /* Blues */
 static volatile int g_root_note     = 48; /* C3 */
-static volatile int g_octave_offset = 0;
+static volatile int g_octave_offset = 2;
 static volatile int g_pad_root      = 60; /* sample root fallback (C4) */
 
 typedef void (*note_setter_fn_t)(void *, int, int, int);
