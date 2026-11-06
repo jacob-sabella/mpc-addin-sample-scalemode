@@ -10,6 +10,7 @@
 #define LOG(fmt, ...) fprintf(stderr, "hold: " fmt "\n", ##__VA_ARGS__)
 static struct { int page, hold_note, hold_ms; } C = { 0, 40, 800 };
 static volatile int g_scale_on;
+static int sixteen_on(void) { return 1; }
 #include "../src/hold.h"
 static void page_popup(void) {}
 

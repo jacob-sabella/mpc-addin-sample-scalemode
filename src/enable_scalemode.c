@@ -712,6 +712,16 @@ static void save_conf(void)
 static volatile int g_scale_on;   /* Scale selected as the 16 Levels Type */
 static void *volatile g_type_ctl; /* Type controller, captured from the firmware's cycle call */
 
+/* 16 Levels on/off: the firmware's 16 Levels button handler (SIXTEEN_BUTTON_OFFSET, called with the same object as the Type
+ * cycle) flips bit 0 of the byte at *(this+0x50)+0x2a3. 1 on, 0 off, -1 not known yet (no 16 Levels press seen since MPC started). */
+static int sixteen_on(void)
+{
+    void *self = g_type_ctl;
+    if (!self) return -1;
+    uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
+    return inner ? *(volatile uint8_t *)(inner + 0x2a3) & 1 : -1;
+}
+
 #include "scale_page.h"
 #include "hold.h"
 
@@ -733,7 +743,8 @@ static int type_cycle_hook(void *self)
 
 static int sixteen_button_hook(void *self)
 {
-    LOG("16-levels-button: this=%p type=%d scale_on=%d", self, current_type(), g_scale_on);
+    g_type_ctl = self;
+    LOG("16-levels-button: this=%p 16levels=%d type=%d scale_on=%d", self, sixteen_on(), current_type(), g_scale_on);
     return 0;
 }
 
@@ -1735,11 +1746,11 @@ static void *socket_worker(void *arg)
                 uintptr_t inner = *(volatile uintptr_t *)((uintptr_t)self + 0x50);
                 int mode = inner ? *(volatile int32_t *)(inner + 0x34) : -1;
                 rlen = snprintf(reply, sizeof reply,
-                    "func=%p set_mode=%p this=%p%s inner=%p type=%d scale_on=%d "
+                    "func=%p set_mode=%p this=%p%s inner=%p type=%d sixteen=%d scale_on=%d "
                     "scale=%s root=%d oct=%d setter=%p main_tid=%lu\n",
                     (void *)g_cycle_func, (void *)g_set_mode_func,
                     self, g_type_ctl ? " (from firmware)" : " (scanned)",
-                    (void *)inner, mode, g_scale_on,
+                    (void *)inner, mode, sixteen_on(), g_scale_on,
                     (g_scale_type >= 0 && g_scale_type < NUM_SCALES)
                         ? scale_names[g_scale_type] : "?",
                     g_root_note, g_octave_offset,

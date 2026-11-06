@@ -17,6 +17,8 @@
 #define SHIFT_NOTE 49
 
 static void page_popup(void);
+static int sixteen_on(void);
+static int hold_inject(int st, int d1, int d2);
 
 static pthread_mutex_t g_hold_mu = PTHREAD_MUTEX_INITIALIZER;
 static unsigned char g_hold_cls[HOLD_MAXFD];   /* 0 unknown, 1 the control surface, 2 not */
@@ -208,6 +210,29 @@ __attribute__((visibility("default"))) int ppoll(struct pollfd *fds, nfds_t nf, 
     }
 }
 
+/* Scale works through 16 Levels, and the hold swallowed the press that would have turned it on: when 16 Levels is off (or not
+ * known yet), give MPC a 16 Levels press of its own. A state not known yet is read back after that press, which is undone if
+ * 16 Levels had been on. Runs on the hold thread; MPC handles the press on its own thread, like a real one. */
+static void hold_press16(void)
+{
+    hold_inject(0x90, C.hold_note, 127);
+    hold_inject(0x80, C.hold_note, 0);
+}
+
+static void hold_ensure_sixteen(void)
+{
+    int was = sixteen_on();
+    if (was == 1) return;
+    hold_press16();
+    for (int i = 0; i < 25 && sixteen_on() != 1; i++) {   /* up to 500 ms for MPC to take it */
+        struct timespec ts = { 0, 20 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    int now = sixteen_on();
+    if (now == 0) hold_press16();   /* it was on after all */
+    LOG("16 Levels %s -> %d", was < 0 ? "unknown" : "off", now == 0 ? 1 : now);
+}
+
 static void *hold_thread(void *arg)
 {
     (void)arg;
@@ -218,7 +243,8 @@ static void *hold_thread(void *arg)
         pthread_mutex_unlock(&g_hold_mu);
         if (fire) {
             g_scale_on = !g_scale_on;
-            LOG("16 Levels held: Scale %s", g_scale_on ? "on" : "off");
+            LOG("16 Levels held: Scale %s (16 Levels %d)", g_scale_on ? "on" : "off", sixteen_on());
+            if (g_scale_on) hold_ensure_sixteen();
             if (C.page) page_popup();
         }
         struct timespec ts = { 0, 20 * 1000000L };
