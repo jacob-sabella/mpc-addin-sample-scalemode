@@ -667,6 +667,23 @@ static void load_scale_conf(void)
         scale_names[g_scale_type], g_root_note, g_pad_root, g_octave_offset);
 }
 
+static void save_conf(void)
+{
+    char dir[256], path[512], tmp[520];
+    addin_dir(dir, sizeof dir);
+    if (!dir[0]) return;
+    snprintf(path, sizeof path, "%s/mpc_enable_scalemode.conf", dir);
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    FILE *f = fopen(tmp, "we");
+    if (!f) return;
+    fprintf(f, "enabled=1\nscale=%s\nroot=%d\noctave_offset=%d\n",
+            scale_names[g_scale_type], g_root_note, g_octave_offset);
+    if (g_pad_root != 60)
+        fprintf(f, "pad_root=%d\n", g_pad_root);
+    fclose(f);
+    rename(tmp, path);
+}
+
 static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
 {
     int mode = *(volatile int *)((uintptr_t)ctx + 0x88);
@@ -1541,6 +1558,7 @@ static void *socket_worker(void *arg)
             int rlen;
             if (found >= 0) {
                 g_scale_type = found;
+                save_conf();
                 rlen = snprintf(reply, sizeof reply, "scale=%s (%d)\n",
                                 scale_names[found], found);
             } else {
@@ -1555,6 +1573,7 @@ static void *socket_worker(void *arg)
             if (midi < 0) midi = atoi(buf + 5);
             if (midi >= 0 && midi <= 127) {
                 g_root_note = midi;
+                save_conf();
                 rlen = snprintf(reply, sizeof reply, "root=MIDI %d\n", midi);
             } else {
                 rlen = snprintf(reply, sizeof reply,
@@ -1567,6 +1586,7 @@ static void *socket_worker(void *arg)
             if (oct < -4) oct = -4;
             if (oct > 4)  oct = 4;
             g_octave_offset = oct;
+            save_conf();
             char reply[64];
             int rlen = snprintf(reply, sizeof reply, "octave_offset=%d\n", oct);
             write(c, reply, rlen);

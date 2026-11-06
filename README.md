@@ -42,7 +42,8 @@ root=C3            # note name with octave, or MIDI number (0-127)
 octave_offset=0    # shift all notes up/down (-4 to 4)
 ```
 
-Settings are read on each MPC startup.
+Settings are read on each MPC startup. Changes via `padctl` are saved
+immediately and persist across restarts.
 
 ## Runtime commands (padctl)
 
