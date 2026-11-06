@@ -6,7 +6,16 @@
 #include <sys/un.h>
 
 int main(int argc, char **argv) {
-    const char *cmd = argc > 1 ? argv[1] : "status";
+    char cmd[128];
+    if (argc <= 1) {
+        snprintf(cmd, sizeof cmd, "status");
+    } else {
+        int off = 0;
+        for (int i = 1; i < argc && off < (int)sizeof cmd - 1; i++) {
+            if (i > 1) cmd[off++] = ' ';
+            off += snprintf(cmd + off, sizeof cmd - off, "%s", argv[i]);
+        }
+    }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return 1; }
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
