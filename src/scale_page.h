@@ -2,7 +2,7 @@
  * enable_scalemode.c, after the scale state it shows).
  *
  * It opens by itself when a long hold of 16 Levels toggles Scale, or with `padctl page`, and closes after PAGE_IDLE_MS without
- * input or on a dial press. While it is up: the soft keys pick the field the dial edits (scale, root, octave), the dial
+ * input or pad hits, or on a dial press. While it is up: the soft keys pick the field the dial edits (scale, root, octave), the dial
  * steps it, K1-K3 set the three directly, and the 16 slots show their notes, the one just played lit. Pads and every
  * other button stay with MPC. Without the draw handler (not installed, or too old for input) there is no page. */
 #include "sample_draw.h"
@@ -33,7 +33,7 @@ static long long pg_now_ms(void)
 }
 
 static void page_popup(void) { g_pg_want = 1; }
-static void page_note_hit(int slot) { g_pg_hit_ms = pg_now_ms(); g_pg_hit_slot = slot; }
+static void page_note_hit(int slot) { long long t = pg_now_ms(); g_pg_hit_ms = t; g_pg_touch = t; g_pg_hit_slot = slot; }   /* playing keeps the page up */
 
 static int slot_midi(int slot)
 {
