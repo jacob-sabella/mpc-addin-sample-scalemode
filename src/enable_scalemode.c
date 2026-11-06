@@ -206,15 +206,6 @@ static uintptr_t find_adrp_add_ref(uintptr_t text_base, size_t text_size, uintpt
     return 0;
 }
 
-static uintptr_t decode_bl(uintptr_t pc)
-{
-    uint32_t w = insn_at(pc);
-    if ((w & 0xFC000000) != 0x94000000) return 0;
-    int32_t imm26 = (int32_t)(w & 0x03FFFFFF);
-    if (imm26 & 0x02000000) imm26 |= (int32_t)0xFC000000;
-    return pc + ((int64_t)imm26 << 2);
-}
-
 /* ── patch logic ── */
 
 /*
@@ -363,68 +354,45 @@ static int try_patch(struct mpc_mapping *m)
     /*
      * Step 3: Find the PadPerformSettings "supported" bool.
      *
-     * The engine init function constructs PadPerformSettings and passes a
-     * bool that controls whether PadPerform is available. This bool is
-     * loaded from a capability struct: LDRB Wn, [Xm, #432].
+     * The engine init loads a bool from the capability struct via
+     *   LDRB Wn, [Xm, #432]
+     * where Xm was set earlier by
+     *   ADD Xm, X_, #0xB40
+     * (engine 'this' + 0xB40 = capability sub-struct; byte at +432
+     * within that sub-struct = PadPerform supported flag).
      *
-     * The padPerformButton string is referenced by the PadPerformSettings
-     * constructor, which is called from the engine init. We find the
-     * constructor's BL callers in the engine init, then look backward for
-     * the LDRB that loads the bool.
-     *
-     * If we find a LDRB Wn, [Xm, #432] near a BL to a function that
-     * also references "padPerformButton", we can patch it to MOV Wn, #1
-     * to force PadPerform enabled.
+     * We scan .text for every LDRB with offset 432 and confirm each by
+     * looking backward for the matching ADD with offset 0xB40 on the
+     * same destination register.  The combination is unique.
      */
-
-    /* Find the function containing the padPerformButton reference. This is
-     * the PadPerformSettings constructor (or a close helper). */
-    uintptr_t ctor_func = 0;
-    for (uintptr_t pc = ppb_ref; pc >= m->text_start && pc > ppb_ref - 8192; pc -= 4) {
+    for (uintptr_t pc = m->text_start; pc < m->text_end; pc += 4) {
         uint32_t w = insn_at(pc);
-        if (w == 0xD503233F || /* PACIASP */
-            (w & 0xFFE003FF) == 0xA98003FD) { /* STP X29, X30, [SP, #-N]! */
-            ctor_func = pc;
-            break;
-        }
-    }
-    if (ctor_func)
-        LOG("PadPerformSettings ctor at %p", (void *)ctor_func);
+        if ((w & 0xFFFFFC00) != 0x3946C000) continue;
 
-    /* Find callers of the constructor in .text — these are in the engine init. */
-    if (ctor_func) {
-        for (uintptr_t pc = m->text_start; pc < m->text_end; pc += 4) {
-            uint32_t w = insn_at(pc);
-            if ((w & 0xFC000000) != 0x94000000) continue;
-            uintptr_t target = decode_bl(pc);
-            if (target != ctor_func) continue;
+        unsigned rt = w & 0x1F;
+        unsigned rn = (w >> 5) & 0x1F;
 
-            LOG("  BL to ctor at %p", (void *)pc);
-
-            /* Search backward from this BL for LDRB Wn, [Xm, #432].
-             * The bool is loaded ~16-60 instructions before the BL. */
-            for (uintptr_t scan = pc - 4; scan >= pc - 256 && scan >= m->text_start; scan -= 4) {
-                uint32_t sw = insn_at(scan);
-                /* LDRB Wt, [Xn, #432]: 0x39400000 | (432<<10) = 0x3946C000 */
-                if ((sw & 0xFFFFFC00) == 0x3946C000) {
-                    unsigned rt = sw & 0x1F;
-                    unsigned rn = (sw >> 5) & 0x1F;
-                    LOG("  found LDRB W%u, [X%u, #432] at %p (PadPerform supported flag)",
-                        rt, rn, (void *)scan);
-
-                    /* Patch: LDRB → MOV Wrt, #1 (0x52800020 | rt) */
-                    uint32_t mov_w1 = 0x52800020 | rt;
-                    if (patch_insn(scan, sw, mov_w1) == 0) {
-                        patches_applied++;
-                        LOG("  PadPerform bool forced to true");
-                    }
-                    goto after_ctor_search;
-                }
+        /* Confirm: ADD X<rn>, X<any>, #0xB40 within 2048 bytes before */
+        uint32_t add_check = 0x912D0000 | rn;  /* ADD Xrn, X?, #0xB40 */
+        int confirmed = 0;
+        for (uintptr_t s = pc - 4; s >= m->text_start && s >= pc - 2048; s -= 4) {
+            if ((insn_at(s) & 0xFFFFFC1F) == add_check) {
+                confirmed = 1;
+                break;
             }
         }
+        if (!confirmed) continue;
+
+        LOG("  LDRB W%u, [X%u, #432] at %p (offset 0x%lx) — PadPerform bool",
+            rt, rn, (void *)pc, (unsigned long)(pc - m->base));
+
+        uint32_t mov_w1 = 0x52800020 | rt;
+        if (patch_insn(pc, w, mov_w1) == 0) {
+            patches_applied++;
+            LOG("  PadPerform bool forced to true");
+        }
+        break;
     }
-after_ctor_search:
-    ;
     /*
      * Step 4: Look for the hardware type comparison gate.
      *
@@ -553,7 +521,8 @@ static void *worker(void *arg)
     sigfillset(&all);
     pthread_sigmask(SIG_SETMASK, &all, NULL);
 
-    usleep(500000);
+    if (!getenv("MPC_ENABLE_SCALEMODE_SYNC"))
+        usleep(500000);
 
     struct mpc_mapping m = find_mpc();
     if (!m.base || !m.text_start) {
@@ -587,6 +556,15 @@ __attribute__((constructor)) static void addin_init(void)
     }
 
     LOG("starting");
+
+    if (getenv("MPC_ENABLE_SCALEMODE_SYNC")) {
+        /* Test mode: run synchronously in the constructor, before main().
+         * Useful under qemu-user where the MPC binary aborts on DRM init
+         * before a background thread would wake up. */
+        LOG("sync mode (test)");
+        worker(NULL);
+        return;
+    }
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, worker, NULL) == 0)
