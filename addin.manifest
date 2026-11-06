@@ -4,4 +4,4 @@ ADDIN_NAME="Enable Scale Mode"
 ADDIN_SO=mpc_enable_scalemode.so
 ADDIN_CONF=mpc_enable_scalemode.conf
 ADDIN_FILES="padctl"
-ADDIN_DONE="Press 16 Levels, then Shift+16 Levels until Scale (the press after the last native Type). Settings: /data/mpc-addins/enable-scalemode/padctl scale Blues | root C3 | octave 2 | status"
+ADDIN_DONE="Hold 16 Levels (about a second) to turn Scale on or off; the SCALE page shows the notes, the soft keys pick scale/root/octave and the dial changes it. Needs the MPC Sample draw handler addin for the page."

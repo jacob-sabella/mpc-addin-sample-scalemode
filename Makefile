@@ -13,7 +13,8 @@ release: build
 	python3 ../mpc-vst-plugins/tools/release_addin.py \
 		--dir build --version $(VERSION) \
 		--repo $(REPO) --license MIT \
-		--about "Adds Scale to the MPC Sample's 16 Levels Type cycle (Shift+16 Levels)"
+		--depends "sample-draw-handler>=0.5.0" \
+		--about "Hold 16 Levels on the MPC Sample to play its 16 slots in a scale, set on a SCALE page"
 
 deploy: build
 	@test -n "$(MPC_HOST)" || { echo "set MPC_HOST (e.g. MPC_HOST=root@192.168.x.x)"; exit 1; }
