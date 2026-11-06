@@ -1,6 +1,7 @@
+# This addin, for the shared installer in mpc-vst-plugins (tools/release/addin; the keys are in its docs/ADDINS.md).
 ADDIN_ID=enable-scalemode
 ADDIN_NAME="Enable Scale Mode"
 ADDIN_SO=mpc_enable_scalemode.so
 ADDIN_CONF=mpc_enable_scalemode.conf
 ADDIN_FILES="padctl"
-ADDIN_DONE="Scale Mode enabled. Cycle: padctl cycle  Set mode: padctl setmode 1  Status: padctl status"
+ADDIN_DONE="Press 16 Levels, then Shift+16 Levels until Scale (the press after the last native Type). Settings: /data/mpc-addins/enable-scalemode/padctl scale Blues | root C3 | octave 2 | status"
