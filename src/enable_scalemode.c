@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define LOG(fmt, ...) fprintf(stderr, "enable-scalemode: " fmt "\n", ##__VA_ARGS__)
@@ -204,6 +206,30 @@ static uintptr_t find_adrp_add_ref(uintptr_t text_base, size_t text_size, uintpt
         return pc;
     }
     return 0;
+}
+
+static uintptr_t decode_bl(uintptr_t pc)
+{
+    uint32_t w = insn_at(pc);
+    if ((w & 0xFC000000) != 0x94000000) return 0;
+    int32_t imm26 = (int32_t)(w & 0x03FFFFFF);
+    if (imm26 & 0x02000000) imm26 |= (int32_t)0xFC000000;
+    return pc + ((int64_t)imm26 << 2);
+}
+
+/*
+ * Decode an ADRP at `pc`: returns the page address it produces.
+ * Returns 0 if the instruction isn't ADRP.
+ */
+static uintptr_t decode_adrp(uintptr_t pc, unsigned *rd_out)
+{
+    uint32_t w = insn_at(pc);
+    if ((w & 0x9F000000) != 0x90000000) return 0;
+    if (rd_out) *rd_out = w & 0x1F;
+    int immhi = (int32_t)(w & 0x00FFFFE0) >> 5;
+    unsigned immlo = (w >> 29) & 3;
+    int64_t imm = ((int64_t)immhi << 2) | immlo;
+    return (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
 }
 
 /* ── patch logic ── */
@@ -500,6 +526,157 @@ static int try_patch(struct mpc_mapping *m)
     return patches_applied > 0 ? 0 : 1;
 }
 
+/* ── pad-mode cycling trigger ── */
+
+/*
+ * The cycling function is a C++ method: the first argument (X0) is the
+ * `this` pointer.  To call it we need to find that pointer at runtime.
+ *
+ * Strategy: find a BL to the cycling function, then walk backward to see
+ * where X0 was loaded.  The typical pattern is:
+ *   ADRP Xn, <global-page>
+ *   LDR  X0, [Xn, #off]          ; load this from a global
+ *   ... (maybe a few instructions)
+ *   BL   cycle_func
+ *
+ * We scan for all BLs to the cycling function, then for each one look
+ * backward for an LDR X0,[Xn,#off] preceded by an ADRP that resolves to
+ * a valid data address.
+ */
+
+static uintptr_t g_cycle_func;
+static uintptr_t g_this_global; /* address of the global that holds `this` */
+
+static void *resolve_this_ptr(void)
+{
+    if (!g_this_global) return NULL;
+    void *ptr = *(void *volatile *)g_this_global;
+    return ptr;
+}
+
+static int find_this_pointer(struct mpc_mapping *m, uintptr_t cycle_func)
+{
+    for (uintptr_t pc = m->text_start; pc < m->text_end; pc += 4) {
+        if (decode_bl(pc) != cycle_func) continue;
+
+        LOG("  BL to cycle func at %p", (void *)pc);
+
+        /* Walk backward up to 64 instructions looking for LDR X0, [Xn, #off]. */
+        for (uintptr_t s = pc - 4; s >= m->text_start && s >= pc - 256; s -= 4) {
+            uint32_t w = insn_at(s);
+
+            /* LDR Xt, [Xn, #imm12]:  1x11 1001 01ii iiii iiii iinn nnnt tttt
+             * We want Xt = X0 (bits 4:0 = 0), 64-bit (bit 30 = 1). */
+            if ((w & 0xFFC0001F) != 0xF9400000) continue;
+
+            unsigned rn = (w >> 5) & 0x1F;
+            unsigned imm12 = (w >> 10) & 0xFFF;
+            uintptr_t offset = (uintptr_t)imm12 << 3; /* scaled by 8 for 64-bit LDR */
+
+            /* Now find ADRP Xrn within a few instructions before. */
+            for (uintptr_t a = s - 4; a >= m->text_start && a >= s - 32; a -= 4) {
+                unsigned adrp_rd;
+                uintptr_t page = decode_adrp(a, &adrp_rd);
+                if (!page || adrp_rd != rn) continue;
+
+                uintptr_t global = page + offset;
+
+                /* Sanity: the global should be in a readable range and hold a
+                 * pointer-sized value that looks like a heap/stack address. */
+                if (global < m->ro_start || global >= m->ro_end) continue;
+
+                void *ptr = *(void *volatile *)global;
+                if (!ptr) continue;
+
+                /* Validate: the object at this+0x34 should hold a valid mode (0-2). */
+                uintptr_t this_addr = (uintptr_t)ptr;
+                int32_t mode = *(volatile int32_t *)(this_addr + 0x34);
+                if (mode < 0 || mode > 2) continue;
+
+                LOG("  this global at %p → %p (mode=%d)",
+                    (void *)global, ptr, mode);
+                g_this_global = global;
+                return 0;
+            }
+        }
+    }
+    LOG("  could not find this pointer for cycling function");
+    return -1;
+}
+
+#define SOCK_PATH "/tmp/padmode.sock"
+
+typedef void (*cycle_fn_t)(void *self);
+
+static void *socket_worker(void *arg)
+{
+    (void)arg;
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, NULL);
+
+    unlink(SOCK_PATH);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { LOG("socket failed: %s", strerror(errno)); return NULL; }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", SOCK_PATH);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        LOG("bind %s failed: %s", SOCK_PATH, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    listen(fd, 2);
+    LOG("listening on %s", SOCK_PATH);
+
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0) continue;
+
+        char buf[64] = {0};
+        ssize_t n = read(c, buf, sizeof buf - 1);
+        buf[n > 0 ? n : 0] = 0;
+        /* strip newline */
+        char *nl = strchr(buf, '\n');
+        if (nl) *nl = 0;
+
+        if (!strcmp(buf, "cycle")) {
+            void *self = resolve_this_ptr();
+            if (self && g_cycle_func) {
+                LOG("calling cycle at %p this=%p", (void *)g_cycle_func, self);
+                ((cycle_fn_t)g_cycle_func)(self);
+                int32_t mode = *(volatile int32_t *)((uintptr_t)self + 0x34);
+                const char *names[] = {"Full Level", "Pad Perform", "16 Level"};
+                const char *name = (mode >= 0 && mode <= 2) ? names[mode] : "?";
+                char reply[64];
+                int rlen = snprintf(reply, sizeof reply, "mode=%d (%s)\n", mode, name);
+                write(c, reply, rlen);
+                LOG("mode after cycle: %d (%s)", mode, name);
+            } else {
+                const char *msg = "no this pointer\n";
+                write(c, msg, strlen(msg));
+            }
+        } else if (!strcmp(buf, "status")) {
+            void *self = resolve_this_ptr();
+            char reply[128];
+            int rlen;
+            if (self) {
+                int32_t mode = *(volatile int32_t *)((uintptr_t)self + 0x34);
+                const char *names[] = {"Full Level", "Pad Perform", "16 Level"};
+                const char *name = (mode >= 0 && mode <= 2) ? names[mode] : "?";
+                rlen = snprintf(reply, sizeof reply,
+                    "func=%p this=%p mode=%d (%s)\n",
+                    (void *)g_cycle_func, self, mode, name);
+            } else {
+                rlen = snprintf(reply, sizeof reply, "no this pointer\n");
+            }
+            write(c, reply, rlen);
+        }
+        close(c);
+    }
+    return NULL;
+}
+
 /* ── entry point ── */
 
 static int is_mpc_process(void)
@@ -540,6 +717,20 @@ static void *worker(void *arg)
         LOG("no gate found to patch — test if pad perform already works");
     else
         LOG("patch failed (rc=%d)", rc);
+
+    /* Find the cycling function and its this pointer for the socket trigger. */
+    uintptr_t cycle = find_cycle_func(&m);
+    if (cycle) {
+        g_cycle_func = cycle;
+        find_this_pointer(&m, cycle);
+    }
+
+    /* Start socket listener if we have at least the function address. */
+    if (g_cycle_func) {
+        pthread_t stid;
+        if (pthread_create(&stid, NULL, socket_worker, NULL) == 0)
+            pthread_detach(stid);
+    }
 
     return NULL;
 }
