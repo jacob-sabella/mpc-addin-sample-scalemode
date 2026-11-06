@@ -603,6 +603,7 @@ static const char *scale_names[] = {
 static volatile int g_scale_type    = 5;  /* Blues */
 static volatile int g_root_note     = 48; /* C3 */
 static volatile int g_octave_offset = 0;
+static volatile int g_pad_root      = 60; /* sample root fallback (C4) */
 
 typedef void (*note_setter_fn_t)(void *, int, int, int);
 static note_setter_fn_t g_note_setter;
@@ -655,11 +656,15 @@ static void load_scale_conf(void)
         } else if (!strcmp(line, "octave_offset")) {
             int oct = atoi(val);
             if (oct >= -4 && oct <= 4) g_octave_offset = oct;
+        } else if (!strcmp(line, "pad_root")) {
+            int midi = parse_note_name(val);
+            if (midi < 0) midi = atoi(val);
+            if (midi >= 0 && midi <= 127) g_pad_root = midi;
         }
     }
     fclose(f);
-    LOG("conf: scale=%s root=%d octave_offset=%d",
-        scale_names[g_scale_type], g_root_note, g_octave_offset);
+    LOG("conf: scale=%s root=%d pad_root=%d octave_offset=%d",
+        scale_names[g_scale_type], g_root_note, g_pad_root, g_octave_offset);
 }
 
 static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
@@ -680,14 +685,18 @@ static int scale_map_hook(void *ctx, uint64_t pad_val, void *pad_ctx)
     int octave   = pad / npo;
     int degree   = pad % npo;
     int interval = scale_intervals[sc][degree];
-    int note     = g_root_note + interval + (octave + g_octave_offset) * 12;
 
-    if (note < 0)   note = 0;
-    if (note > 127) note = 127;
+    int root_off = (g_root_note % 12) - (g_pad_root % 12);
+    if (root_off > 5)  root_off -= 12;
+    if (root_off < -6) root_off += 12;
+
+    int note = interval + (octave + g_octave_offset) * 12 + root_off - 24;
+    if (note < -120) note = -120;
+    if (note > 120)  note = 120;
 
     if (hits <= 16)
-        LOG("hook[%d]: pad=%d scale=%s note=%d (root=%d interval=%d oct=%d)",
-            hits, pad, scale_names[sc], note, g_root_note, interval, octave);
+        LOG("hook[%d]: pad=%d scale=%s offset=%d (root_off=%d interval=%d oct=%d)",
+            hits, pad, scale_names[sc], note, root_off, interval, octave);
 
     *(volatile uint8_t *)((uintptr_t)pad_ctx + 0x31) = 0;
 
@@ -1572,13 +1581,16 @@ static void *socket_worker(void *arg)
             int octave = pad / npo;
             int degree = pad % npo;
             int interval = scale_intervals[sc][degree];
-            int note = g_root_note + interval + (octave + g_octave_offset) * 12;
-            if (note < 0) note = 0;
-            if (note > 127) note = 127;
+            int ro = (g_root_note % 12) - (g_pad_root % 12);
+            if (ro > 5)  ro -= 12;
+            if (ro < -6) ro += 12;
+            int note = interval + (octave + g_octave_offset) * 12 + ro - 24;
+            if (note < -120) note = -120;
+            if (note > 120)  note = 120;
             char reply[256];
             int rlen = snprintf(reply, sizeof reply,
-                "pad=%d scale=%s degree=%d interval=%d octave=%d -> MIDI note %d\n",
-                pad, scale_names[sc], degree, interval, octave, note);
+                "pad=%d scale=%s degree=%d interval=%d octave=%d root_off=%d -> offset %d\n",
+                pad, scale_names[sc], degree, interval, octave, ro, note);
             write(c, reply, rlen);
 
         } else if (!strcmp(buf, "hookhits")) {
