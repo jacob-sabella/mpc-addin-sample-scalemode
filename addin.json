@@ -1,0 +1,14 @@
+{
+  "id": "enable-scalemode",
+  "name": "Enable Scale Mode",
+  "version": "0.1.0",
+  "description": "Unlocks Pad Perform / Scale Mode on devices where the firmware has it but the UI hides it.",
+  "so": "mpc_enable_scalemode.so",
+  "conf": "mpc_enable_scalemode.conf",
+  "files": ["padctl"],
+  "devices": ["mpc-sample"],
+  "arch": "aarch64",
+  "author": "Jacob Sabella",
+  "license": "MIT",
+  "repository": "jacob-sabella/mpc-addin-enable-scalemode"
+}
