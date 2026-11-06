@@ -17,9 +17,10 @@ play the notes of a scale instead of those steps.
    play and shows every slot's note, the root's notes in cyan.
 
 On the page: the three soft keys pick **SCALE**, **ROOT** or **OCT**, the dial
-changes it, K1-K3 set the three directly, and pressing the dial closes the page.
-It also closes about 4 seconds after the last input or pad hit, giving the screen
-back to MPC. Changes are saved to the settings file and survive a restart; Scale
+changes it, K1-K3 set the three directly, and pressing the dial closes the page
+(holding 16 Levels twice, Scale off and on, brings it back). The page stays
+up for as long as Scale is on; after the hold that turns Scale off it gives the
+screen back to MPC a few seconds later. Changes are saved to the settings file and survive a restart; Scale
 itself starts off each time MPC starts.
 
 The page needs the [MPC Sample draw handler](https://github.com/jacob-sabella/mpc-addin-sample-draw-handler)

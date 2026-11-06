@@ -1,8 +1,9 @@
 /* scale_page.h: the SCALE page on the MPC Sample's screen, through mpc-addin-sample-draw-handler (included once, by
  * enable_scalemode.c, after the scale state it shows).
  *
- * It opens by itself when a long hold of 16 Levels toggles Scale, or with `padctl page`, and closes after PAGE_IDLE_MS without
- * input or pad hits, or on a dial press. While it is up: the soft keys pick the field the dial edits (scale, root, octave), the dial
+ * It opens by itself when a long hold of 16 Levels toggles Scale, or with `padctl page`, and stays while Scale is on; a dial
+ * press closes it (holding 16 Levels twice, Scale off and on, brings it back), and with Scale off it closes after PAGE_IDLE_MS without
+ * input. While it is up: the soft keys pick the field the dial edits (scale, root, octave), the dial
  * steps it, K1-K3 set the three directly, and the 16 slots show their notes, the one just played lit. Pads and every
  * other button stay with MPC. Without the draw handler (not installed, or too old for input) there is no page. */
 #include "sample_draw.h"
@@ -154,7 +155,7 @@ static void *page_thread(void *arg)
             if (g_pg_api->request(g_pg) != 0) LOG("page: no display yet");
         }
         int up = g_pg_api->has_screen(g_pg);
-        if (up && (g_pg_close || now - g_pg_touch > PAGE_IDLE_MS)) {
+        if (up && (g_pg_close || (!g_scale_on && now - g_pg_touch > PAGE_IDLE_MS))) {   /* with Scale on it stays */
             g_pg_api->release(g_pg);
             up = 0;
         }
