@@ -25,6 +25,7 @@ static volatile long long g_pg_touch; /* last input, ms */
 static volatile long long g_pg_dirty; /* last unsaved change, ms (0: saved) */
 static volatile int g_pg_hit_slot = -1;
 static volatile long long g_pg_hit_ms;
+static int g_pg_lit = -1;          /* the slot drawn lit (page thread) */
 
 static long long pg_now_ms(void)
 {
@@ -113,8 +114,8 @@ static void pg_render(sdc_canvas *cv)
     sdc_text(cv, 8, 76, 1, PG_DIM, "DIAL: CHANGE   PRESS: DONE   K1-K3: SET");
 
     /* banks A (bottom) to D (top), slots left to right */
-    int hit = g_pg_hit_slot;
-    int lit = hit >= 0 && pg_now_ms() - g_pg_hit_ms < 250;
+    int hit = g_pg_lit;
+    int lit = hit >= 0;
     for (int bank = 0; bank < 4; bank++) {
         int y = 236 - (bank + 1) * 36;
         char b[2] = { (char)('A' + bank), 0 };
@@ -160,14 +161,29 @@ static void *page_thread(void *arg)
             up = 0;
         }
         g_pg_close = 0;
+        /* Each refresh is a synchronous transfer to the SPI panel that MPC's own screen updates wait on (seen as pad latency,
+         * 2026-11-06), so send only what changed: the whole page when a setting changes, else the slot that lights or goes dark. */
+        static int was_up, last_sig = -1, last_lit = -1;
         if (up) {
             sdc_canvas cv;
             cv.px = g_pg_api->pixels(g_pg, &cv.stride);
             cv.w = g_pg_api->width;
             cv.h = g_pg_api->height;
-            pg_render(&cv);
-            g_pg_api->present(g_pg, 0, 0, 0, 0);
+            int sig = ((((g_scale_type * 128 + g_root_note) * 16 + g_octave_offset + 8) * 4 + g_pg_field) * 2 + g_scale_on);
+            int lit = g_pg_hit_slot >= 0 && now - g_pg_hit_ms < 250 ? g_pg_hit_slot : -1;
+            g_pg_lit = lit;
+            if (!was_up || sig != last_sig) {
+                pg_render(&cv);
+                g_pg_api->present(g_pg, 0, 0, 0, 0);
+            } else if (lit != last_lit) {
+                pg_render(&cv);
+                int s[2] = { last_lit, lit };
+                for (int i = 0; i < 2; i++)
+                    if (s[i] >= 0) g_pg_api->present(g_pg, 22 + (s[i] % 4) * 74, 236 - (s[i] / 4 + 1) * 36, 70, 32);
+            }
+            last_sig = sig; last_lit = lit;
         }
+        was_up = up;
         long long dirty = g_pg_dirty;
         if (dirty && now - dirty > PAGE_SAVE_MS) {
             g_pg_dirty = 0;

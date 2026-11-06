@@ -1719,6 +1719,33 @@ static void *socket_worker(void *arg)
             else
                 snprintf(reply, sizeof reply, "%s ch%d %d\n", on ? "on" : "off", ch, nt);
             write(c, reply, strlen(reply));
+        } else if (!strncmp(buf, "lat ", 4)) {
+            /* lat scale|page <n> <period ms>: n hits of slot 0 on an exact grid, Scale (or the SCALE page) flipped before every
+             * other one, for a latency check against the Sample's audio (even hits: as found, odd hits: flipped). */
+            char what[8] = ""; int n = 0, per = 0;
+            char reply[96];
+            if (sscanf(buf + 4, "%7s %d %d", what, &n, &per) < 3 || n < 2 || n > 64 || per < 150 || per > 2000
+                || (strcmp(what, "scale") && strcmp(what, "page"))) {
+                snprintf(reply, sizeof reply, "usage: lat scale|page <hits 2-64> <period ms 150-2000>\n");
+            } else {
+                int scale0 = g_scale_on, page = !strcmp(what, "page");
+                struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+                for (int k = 0; k < n; k++) {
+                    int flip = k & 1;
+                    if (page) { if (flip) g_pg_close = 1; else g_pg_want = 1; }
+                    else g_scale_on = flip ? !scale0 : scale0;
+                    long long ns = t.tv_nsec + 200000000LL + (long long)per * 1000000LL * k;   /* 200 ms for the flip */
+                    struct timespec at = { t.tv_sec + ns / 1000000000LL, ns % 1000000000LL };
+                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &at, NULL);
+                    hold_inject(0x99, 37, 110);
+                    usleep(80000);
+                    hold_inject(0x89, 37, 0);
+                }
+                g_scale_on = scale0;
+                if (page) g_pg_want = 1;
+                snprintf(reply, sizeof reply, "lat %s: %d hits every %d ms\n", what, n, per);
+            }
+            write(c, reply, strlen(reply));
         } else if (!strcmp(buf, "leds")) {
             char reply[600];
             int rlen = hold_leds(reply, sizeof reply);

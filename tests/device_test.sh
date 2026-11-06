@@ -5,7 +5,8 @@
 #   MPC_HOST=root@<device> [SSH_KEY=~/.ssh/key] tests/device_test.sh [out_dir]
 # AUDIO_SRC=<PulseAudio/PipeWire source of the Sample's USB audio> also records the 16 slots in Blues and checks each one's
 # pitch (tests/pitch_check.py). Load a pitched sample on the 16 Levels pad first (a saw at C3 with a short fade works best;
-# PITCH_MODE=clicks instead for a drum sample with two or more transients)).
+# PITCH_MODE=clicks instead for a drum sample with two or more transients), and checks that the SCALE page and Scale add no
+# delay to a pad (padctl lat, tests/latency_check.py).
 # RESTART=1 also checks that a scale changed on the page survives an MPC restart (restarts MPC once).
 # out_dir (default build/device-test) gets the page frames while pads play, and page.gif when ffmpeg is installed.
 set -euo pipefail
@@ -70,6 +71,12 @@ if [ -n "${AUDIO_SRC:-}" ]; then
     if [ "${PITCH_MODE:-spectrum}" = clicks ]; then args=(clicks "$OUT/slots.wav" 16 $BLUES); else args=(spectrum "$OUT/slots.wav" auto 1.8 16 $BLUES); fi
     python3 tests/pitch_check.py "${args[@]}" > "$OUT/pitch.txt" && ok "the 16 slots sound in Blues (audio, $OUT/pitch.txt)" \
         || { bad "slot pitches (audio)"; cat "$OUT/pitch.txt"; }
+    for what in page scale; do   # what the SCALE page and Scale add to a pad's delay: every other hit flipped, on an exact grid
+        timeout 16 parecord -d "$AUDIO_SRC" --file-format=wav --format=s32le --rate=44100 --channels=2 "$OUT/lat-$what.wav" & rec=$!
+        sleep 1; pc lat $what 24 500 >/dev/null; wait $rec || true
+        python3 tests/latency_check.py "$OUT/lat-$what.wav" 0.5 10 > "$OUT/lat-$what.txt" \
+            && ok "the $what adds no pad delay ($(tail -n 1 "$OUT/lat-$what.txt"))" || { bad "$what adds pad delay"; cat "$OUT/lat-$what.txt"; }
+    done
 fi
 
 hold

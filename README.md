@@ -79,6 +79,7 @@ padctl testmap 0       # dry run: what pad 0 would play
 padctl hookhits        # how many times the note hook has fired
 padctl note <ch> <note> [vel] [hold ms]   # inject a control-surface press (testing)
 padctl on|off <ch> <note> [vel]           # one half of a press, for combinations
+padctl lat scale|page <hits> <period ms>  # slot 0 on an exact grid, Scale or the page flipped every other hit (latency test)
 ```
 
 ## Testing
@@ -87,7 +88,11 @@ padctl on|off <ch> <note> [vel]           # one half of a press, for combination
 - `tests/device_test.sh`: the whole sequence on a Sample over SSH, no hands on the
   device. Button and pad presses go in with `padctl note/on/off`, the screen comes
   back through the draw handler's `/snap`, and the page frames come out as a GIF.
-  `RESTART=1` also checks that a page change survives an MPC restart.
+  `RESTART=1` also checks that a page change survives an MPC restart. With `AUDIO_SRC` (the
+  Sample's USB audio on the computer) it checks every slot's pitch and that the page and Scale
+  add no delay to a pad (`padctl lat`, `tests/latency_check.py`): on 2026-11-06 the page, which
+  then refreshed the whole screen 16 times a second, made pads up to 80 ms late (18 ms on average); it now
+  sends only what changed, and neither adds a measurable delay.
 
   ```sh
   MPC_HOST=root@<device> SSH_KEY=~/.ssh/<key> RESTART=1 tests/device_test.sh
