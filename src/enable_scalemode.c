@@ -1562,6 +1562,25 @@ static void *socket_worker(void *arg)
             int rlen = snprintf(reply, sizeof reply, "octave_offset=%d\n", oct);
             write(c, reply, rlen);
 
+        } else if (!strncmp(buf, "testmap ", 8) || !strcmp(buf, "testmap")) {
+            int pad = (!strncmp(buf, "testmap ", 8)) ? atoi(buf + 8) : 0;
+            if (pad < 0) pad = 0;
+            if (pad > 15) pad = 15;
+            int sc = g_scale_type;
+            if (sc < 0 || sc >= NUM_SCALES) sc = 0;
+            int npo = scale_npo[sc];
+            int octave = pad / npo;
+            int degree = pad % npo;
+            int interval = scale_intervals[sc][degree];
+            int note = g_root_note + interval + (octave + g_octave_offset) * 12;
+            if (note < 0) note = 0;
+            if (note > 127) note = 127;
+            char reply[256];
+            int rlen = snprintf(reply, sizeof reply,
+                "pad=%d scale=%s degree=%d interval=%d octave=%d -> MIDI note %d\n",
+                pad, scale_names[sc], degree, interval, octave, note);
+            write(c, reply, rlen);
+
         } else if (!strcmp(buf, "hookhits")) {
             char reply[128];
             int rlen = snprintf(reply, sizeof reply, "hook_hits=%d\n", g_hook_hits);
