@@ -43,9 +43,31 @@ struct conf {
     int hold_note;        /* the button whose long hold toggles Scale: 16 Levels */
     int hold_ms;
     int detect_pitch;     /* 0 off, 1 hear a sample MPC has no root note for (MPC's 60), 2 hear every sample */
+    int lock_input;       /* while Scale is on, buttons and knobs other than pass_notes don't reach MPC (hold.h) */
+    unsigned char pass[128];   /* channel-1 button notes that still reach MPC while Scale is on */
 };
 
-static struct conf C = { .enabled = 1, .padperform_patch = 0, .page = 1, .hold_note = 40, .hold_ms = 800, .detect_pitch = 1 };
+static struct conf C = { .enabled = 1, .padperform_patch = 0, .page = 1, .hold_note = 40, .hold_ms = 800, .detect_pitch = 1,
+                         .lock_input = 1 };
+
+/* "49,73,80": the notes listed (0-127) set in out, the rest cleared; returns how many */
+static int parse_notes(const char *v, unsigned char out[128])
+{
+    memset(out, 0, 128);
+    int n = 0;
+    for (const char *p = v; *p; ) {
+        char *e;
+        long x = strtol(p, &e, 10);
+        if (e == p) { p++; continue; }
+        if (x >= 0 && x < 128) { out[x] = 1; n++; }
+        p = e;
+    }
+    return n;
+}
+
+/* Shift, Rec, Overdub, Stop, Play, Play Start, and 84-87 (the four buttons the remote addin calls PAD-1..4) */
+#define PASS_NOTES_DEFAULT "49,73,80,81,82,83,84,85,86,87"
+
 
 static void addin_dir(char *out, size_t n)
 {
@@ -80,6 +102,7 @@ static const char *detect_name(int d) { return d == 0 ? "off" : d == 2 ? "always
 static void load_conf(void)
 {
     char dir[256], path[512];
+    parse_notes(PASS_NOTES_DEFAULT, C.pass);
     addin_dir(dir, sizeof dir);
     if (!dir[0]) return;
     snprintf(path, sizeof path, "%s/mpc_sample_scalemode.conf", dir);
@@ -99,6 +122,8 @@ static void load_conf(void)
         else if (!strcmp(line, "hold_note")) C.hold_note = atoi(val);
         else if (!strcmp(line, "hold_ms")) C.hold_ms = atoi(val) >= 200 ? atoi(val) : 200;
         else if (!strcmp(line, "detect_pitch")) C.detect_pitch = parse_detect(val);
+        else if (!strcmp(line, "lock_input")) C.lock_input = atoi(val);
+        else if (!strcmp(line, "pass_notes")) parse_notes(val, C.pass);
     }
     fclose(f);
 }
@@ -1971,6 +1996,13 @@ static void *socket_worker(void *arg)
             else snprintf(reply, sizeof reply, "mpc_root=%d heard=%d aperiodicity=%.3f frames=%d used=%s\n", mroot, ps->midi,
                           ps->aper, ps->frames, ps->midi >= 0 && C.detect_pitch && (mroot == 60 || C.detect_pitch == 2) ? "heard" : "mpc");
             write(c, reply, strlen(reply));
+        } else if (!strncmp(buf, "raw", 3)) {
+            /* raw [n]: log the raw bytes of the next n control-surface reads (default 200) to MPC's journal */
+            int n = atoi(buf + 3);
+            g_raw_log = n > 0 ? n : 200;
+            char reply[64];
+            int rlen = snprintf(reply, sizeof reply, "logging the next %d surface reads\n", g_raw_log);
+            write(c, reply, rlen);
         } else if (!strcmp(buf, "leds")) {
             char reply[600];
             int rlen = hold_leds(reply, sizeof reply);

@@ -13,17 +13,24 @@ play the notes of a scale instead of those steps.
 
 1. Put a melodic sample on a pad and press **16 Levels** to turn it on.
 2. **Hold 16 Levels** for about a second: Scale turns on and the SCALE page opens.
-   Hold it again to turn Scale off. A short press is still a normal 16 Levels press,
-   and Shift+16 Levels still cycles the Type.
+   Hold it again: Scale turns off and MPC's screen comes straight back. The page and
+   Scale go together. A short press is still a normal 16 Levels press, and
+   Shift+16 Levels still cycles the Type.
 3. Play the pads; switch banks for the higher notes. The page lights the slot you
    play and shows every slot's note, the root's notes in cyan.
 
 On the page: the three soft keys pick **SCALE**, **ROOT** or **OCT**, the dial
-changes it, K1-K3 set the three directly, and pressing the dial closes the page
-(holding 16 Levels twice, Scale off and on, brings it back). The page stays
-up for as long as Scale is on; after the hold that turns Scale off it gives the
-screen back to MPC a few seconds later. Changes are saved to the settings file and survive a restart; Scale
-itself starts off each time MPC starts.
+changes it, K1-K3 set the three directly, and pressing the dial exits (Scale off,
+like a hold). If another page takes the screen while Scale is on, a hold brings
+the SCALE page back. Changes are saved to the settings file and survive a restart;
+Scale itself starts off each time MPC starts.
+
+**Input lock.** While Scale is on, the other buttons and knobs don't reach MPC, so
+nothing changes MPC's screen or settings underneath the page. The pads, 16 Levels,
+Shift, the transport (Rec, Overdub, Stop, Play, Play Start) and the bank buttons
+still work; `lock_input=0` turns the lock off and `pass_notes` lets more buttons
+through. Each control kept from MPC is logged (the first 64), with its note, for
+adding to `pass_notes`.
 
 Recording works as with 16 Levels: hits recorded into a sequence (Overdub while it
 plays) keep their scale notes, stored as each event's coarse tuning, and play back at
@@ -63,6 +70,8 @@ root=C3            # note name with octave, or MIDI number (0-127)
 octave_offset=2    # -4 to 4; 2 puts bank A's first pad on the root
 hold_ms=800        # how long a hold of 16 Levels toggles Scale (at least 200)
 page=1             # 0: no SCALE page
+lock_input=1       # 0: buttons and knobs reach MPC while Scale is on
+pass_notes=49,73,80,81,82,83,84,85,86,87   # buttons that do reach MPC while Scale is on
 padperform_patch=0 # 1 forces the PadPerform bool (blocks 16 Levels)
 pad_root=60        # only when MPC's root note for the sample can't be read (see below)
 detect_pitch=untagged # untagged: hear samples at MPC's 60; always: hear every sample; off
@@ -106,6 +115,7 @@ padctl page            # open the SCALE page
 padctl testmap 0       # dry run: what pad 0 would play
 padctl hear            # the pitch heard in the last sample played, beside MPC's root note
 padctl detect always   # when to go by ear: untagged (default), always or off (saved)
+padctl raw [n]         # log the raw bytes of the next n control-surface reads (default 200) to MPC's journal
 padctl hookhits        # how many times the note hook has fired
 padctl note <ch> <note> [vel] [hold ms]   # inject a control-surface press (testing)
 padctl on|off <ch> <note> [vel]           # one half of a press, for combinations

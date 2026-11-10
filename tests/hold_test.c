@@ -8,11 +8,20 @@
 #include <time.h>
 #include <unistd.h>
 #define LOG(fmt, ...) fprintf(stderr, "hold: " fmt "\n", ##__VA_ARGS__)
-static struct { int page, hold_note, hold_ms; } C = { 0, 40, 800 };
+static struct { int page, hold_note, hold_ms, lock_input; unsigned char pass[128]; } C = { 0, 40, 800, 0, {0} };
 static volatile int g_scale_on;
+static void *g_pg;
+static int g_shown;
 static int sixteen_on(void) { return 1; }
 #include "../src/hold.h"
 static void page_popup(void) {}
+static int page_shown(void) { return g_shown; }
+static void cc(unsigned char *f, int num, int val)
+{
+    memset(f, 0, HOLD_FRAME);
+    f[1] = 3;
+    f[HOLD_DATA] = 0xB0; f[HOLD_DATA + 1] = (unsigned char)num; f[HOLD_DATA + 2] = (unsigned char)val;
+}
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -55,10 +64,34 @@ int main(void)
     CHECK(feed(0, 40, b) == HOLD_FRAME && !on_of(b) && g_hold_npend == 0);
     CHECK(feed(0, 49, b) == HOLD_FRAME && !g_shift_down);
 
+    g_scale_on = 0;
     /* other buttons and a mixed read pass untouched; 16 Levels inside it is held back */
     frame(b, 1, 36); frame(b + HOLD_FRAME, 1, 40);
     CHECK(hold_filter(7, b, 2 * HOLD_FRAME) == HOLD_FRAME && note_of(b) == 36);
     g_hold_held = 0;
+
+    /* input lock, Scale on: buttons and knobs kept from MPC, except 16 Levels, pass_notes, pads, releases */
+    C.lock_input = 1; C.pass[49] = C.pass[82] = 1; g_scale_on = 1; g_shown = 0;
+    CHECK(feed(1, 7, b) == 0);                       /* MAIN: dropped */
+    CHECK(feed(0, 7, b) == HOLD_FRAME);              /* its release passes */
+    CHECK(feed(1, 82, b) == HOLD_FRAME);             /* Play */
+    CHECK(feed(1, 49, b) == HOLD_FRAME); feed(0, 49, b);   /* Shift */
+    CHECK(feed(1, 12, b) == 0);                      /* soft key, page not up: dropped */
+    cc(b, 19, 64); CHECK(hold_filter(7, b, HOLD_FRAME) == 0);   /* a knob */
+    cc(b, 16, 64); CHECK(hold_filter(7, b, HOLD_FRAME) == 0);   /* K1, page not up */
+    frame(b, 1, 37); b[HOLD_DATA] = 0x99; CHECK(hold_filter(7, b, HOLD_FRAME) == HOLD_FRAME);   /* a pad (channel 10) */
+    g_shown = 1;   /* the SCALE page is up: the controls the draw handler gives it pass on to it */
+    CHECK(feed(1, 12, b) == HOLD_FRAME && feed(1, 111, b) == HOLD_FRAME);
+    cc(b, 16, 64); CHECK(hold_filter(7, b, HOLD_FRAME) == HOLD_FRAME);
+    cc(b, 100, 1); CHECK(hold_filter(7, b, HOLD_FRAME) == HOLD_FRAME);
+    cc(b, 19, 64); CHECK(hold_filter(7, b, HOLD_FRAME) == 0);
+    {   /* two messages in one frame: the dropped one is cut out */
+        frame(b, 1, 7); b[1] = 6; b[HOLD_DATA + 3] = 0x90; b[HOLD_DATA + 4] = 82; b[HOLD_DATA + 5] = 0x7f;
+        CHECK(hold_filter(7, b, HOLD_FRAME) == HOLD_FRAME && b[1] == 3 && note_of(b) == 82 && b[HOLD_DATA + 3] == 0);
+    }
+    g_scale_on = 0;   /* Scale off: everything passes */
+    CHECK(feed(1, 7, b) == HOLD_FRAME);
+    cc(b, 19, 64); CHECK(hold_filter(7, b, HOLD_FRAME) == HOLD_FRAME);
 
     /* an unframed read is left alone */
     unsigned char raw[3] = { 0x90, 40, 0x7f };

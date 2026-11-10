@@ -6,7 +6,13 @@
  * within hold_ms and MPC gets the press then, and the release on its next read (poll() and ppoll() are told about it);
  * held past hold_ms, Scale toggles and MPC sees nothing. With Shift down the press passes straight through, so
  * Shift+16 Levels (the Type cycle) is unchanged. The draw handler addin filters the same port the same way for PAD FX;
- * both wrap read() and pass on to the next library, so they chain. */
+ * both wrap read() and pass on to the next library, so they chain.
+ *
+ * Input lock (lock_input=1): while Scale is on, MPC's screen stays as it was. Every channel-1 press and control change is
+ * dropped, except 16 Levels, the notes in pass_notes (Shift, transport, the bank buttons) and, while the SCALE page has
+ * the screen, the controls the draw handler gives it (soft keys 12-14, dial press 111, K1-K3 CC 16-18, dial CC 100): the
+ * draw handler loads before this addin, so its read() sees what this one lets through. Pads (channel 10) and every
+ * release pass, so nothing MPC saw go down stays held. */
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -17,6 +23,7 @@
 #define SHIFT_NOTE 49
 
 static void page_popup(void);
+static int page_shown(void);
 static int sixteen_on(void);
 static int hold_inject(int st, int d1, int d2);
 
@@ -63,13 +70,57 @@ static int hold_framed(const unsigned char *b, ssize_t n)
     return 1;
 }
 
+static volatile int g_raw_log;   /* padctl raw: reads left to log raw */
+static int g_block_log = 64;   /* the first dropped controls are logged, to learn a button to add to pass_notes */
+
+/* A whole channel message m (3 bytes) that the input lock keeps from MPC. */
+static int lock_drops(const unsigned char *m)
+{
+    if (!g_scale_on || !C.lock_input || (m[0] & 15) != 0) return 0;
+    int kind = m[0] & 0xF0, up = page_shown();
+    int drop = 0;
+    if (kind == 0xB0)
+        drop = !(up && (m[1] == 16 || m[1] == 17 || m[1] == 18 || m[1] == 100));
+    else if (kind == 0x90 && m[2])
+        drop = m[1] != C.hold_note && !C.pass[m[1]] && !(up && (m[1] == 12 || m[1] == 13 || m[1] == 14 || m[1] == 111));
+    if (drop && g_block_log > 0) {
+        g_block_log--;
+        LOG("Scale on: kept from MPC: %s %d", kind == 0xB0 ? "cc" : "note", m[1]);
+    }
+    return drop;
+}
+
+/* Cut the messages the input lock drops out of a frame (lock held): 1 when nothing is left of it. */
+static int lock_frame(unsigned char *fr)
+{
+    unsigned char *d = fr + HOLD_DATA;
+    int len = fr[1] > HOLD_DATA ? HOLD_DATA : fr[1], w = 0, cut = 0;
+    for (int j = 0; j < len; ) {
+        if (j + 3 <= len && (d[j] & 0xF0) >= 0x80 && (d[j] & 0xF0) <= 0xB0 && !(d[j + 1] & 0x80) && !(d[j + 2] & 0x80)
+            && lock_drops(d + j)) { j += 3; cut = 1; continue; }
+        d[w++] = d[j++];
+    }
+    if (!cut) return 0;
+    if (!w) return 1;
+    fr[1] = (unsigned char)w;
+    memset(d + w, 0, (size_t)(HOLD_DATA - w));
+    return 0;
+}
+
 /* Frames MPC just read (lock held): returns the new length. */
 static ssize_t hold_filter(int fd, unsigned char *b, ssize_t n)
 {
+    if (g_raw_log > 0) {
+        g_raw_log--;
+        char hx[3 * 96 + 1]; int k = 0;
+        for (ssize_t j = 0; j < n && j < 96; j++) k += snprintf(hx + k, sizeof hx - (size_t)k, "%02x ", b[j]);
+        LOG("raw %zd: %s", n, hx);
+    }
     if (!hold_framed(b, n)) return n;
     ssize_t o = 0;
     for (ssize_t f = 0; f + HOLD_FRAME <= n; f += HOLD_FRAME) {
         unsigned char *fr = b + f, *d = fr + HOLD_DATA;
+        if (lock_frame(fr)) continue;
         if (g_pad_log > 0 && (d[0] & 15) == 9) {
             g_pad_log--;
             LOG("ch10: %02x %02x %02x (len %d)", d[0], d[1], d[2], fr[1]);
@@ -283,10 +334,17 @@ static void *hold_thread(void *arg)
         if (g_hold_held && !g_hold_fired && hold_now_ms() - g_hold_since >= C.hold_ms) { g_hold_fired = 1; fire = 1; }
         pthread_mutex_unlock(&g_hold_mu);
         if (fire) {
-            g_scale_on = !g_scale_on;
-            LOG("16 Levels held: Scale %s (16 Levels %d)", g_scale_on ? "on" : "off", sixteen_on());
-            if (g_scale_on) hold_ensure_sixteen();
-            if (C.page) page_popup();
+            if (g_scale_on && C.page && g_pg && !page_shown()) {   /* another page took the screen: bring SCALE back */
+                LOG("16 Levels held: SCALE page back (Scale stays on)");
+                page_popup();
+            } else {   /* the page is Scale: both on, or both off (the page thread gives the screen back) */
+                g_scale_on = !g_scale_on;
+                LOG("16 Levels held: Scale %s (16 Levels %d)", g_scale_on ? "on" : "off", sixteen_on());
+                if (g_scale_on) {
+                    hold_ensure_sixteen();
+                    if (C.page) page_popup();
+                }
+            }
         }
         struct timespec ts = { 0, 20 * 1000000L };
         nanosleep(&ts, NULL);

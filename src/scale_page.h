@@ -1,11 +1,12 @@
 /* scale_page.h: the SCALE page on the MPC Sample's screen, through mpc-addin-sample-draw-handler (included once, by
  * sample_scalemode.c, after the scale state it shows).
  *
- * It opens by itself when a long hold of 16 Levels toggles Scale, or with `padctl page`, and stays while Scale is on; a dial
- * press closes it (holding 16 Levels twice, Scale off and on, brings it back), and with Scale off it closes after PAGE_IDLE_MS without
- * input. While it is up: the soft keys pick the field the dial edits (scale, root, octave), the dial
- * steps it, K1-K3 set the three directly, and the 16 slots show their notes, the one just played lit. Pads and every
- * other button stay with MPC. Without the draw handler (not installed, or too old for input) there is no page. */
+ * The page is Scale: a long hold of 16 Levels turns both on, the next hold (or a dial press) turns both off and gives the
+ * screen straight back to MPC. If another page took the screen meanwhile, the hold brings this one back instead.
+ * `padctl page` opens it with Scale off too; then it closes after PAGE_IDLE_MS without input. While it is up: the soft
+ * keys pick the field the dial edits (scale, root, octave), the dial steps it, K1-K3 set the three directly, and the 16
+ * slots show their notes, the one just played lit. What else reaches MPC while Scale is on is hold.h's input lock.
+ * Without the draw handler (not installed, or too old for input) there is no page. */
 #include "sample_draw.h"
 #include <stdio.h>
 #include <time.h>
@@ -35,6 +36,7 @@ static long long pg_now_ms(void)
 }
 
 static void page_popup(void) { g_pg_want = 1; }
+static int page_shown(void) { return g_pg_api && g_pg && g_pg_api->has_screen(g_pg); }
 static void page_note_hit(int slot) { long long t = pg_now_ms(); g_pg_hit_ms = t; g_pg_touch = t; g_pg_hit_slot = slot; }   /* playing keeps the page up */
 
 /* what a slot sounds: the sample's root (as MPC has it, else pad_root) moved by the slot's offset */
@@ -73,7 +75,7 @@ static void pg_input(void *user, const mpc_sdraw_event *e)
     g_pg_touch = pg_now_ms();
     if (e->type == MPC_SDRAW_EV_KEY && e->value) {
         if (e->id >= 0 && e->id <= 2) g_pg_field = e->id;
-        else if (e->id == 3) g_pg_close = 1;
+        else if (e->id == 3) { g_scale_on = 0; g_pg_close = 1; LOG("dial pressed: Scale off"); }   /* the page is Scale */
     } else if (e->type == MPC_SDRAW_EV_DIAL) {
         pg_step(g_pg_field, e->value);
     } else if (e->type == MPC_SDRAW_EV_KNOB && e->id >= 0 && e->id <= 2) {
@@ -117,7 +119,7 @@ static void pg_render(sdc_canvas *cv)
     sdc_text(cv, x + 18 + sdc_text_width(line, 2) + 18, 60, 1, PG_DIM, smp);
     const char *state = g_scale_on ? "ON" : "OFF";
     sdc_text(cv, cv->w - 8 - sdc_text_width(state, 2), 56, 2, g_scale_on ? PG_CYAN : PG_DIM, state);
-    sdc_text(cv, 8, 76, 1, PG_DIM, "DIAL: CHANGE   PRESS: DONE   K1-K3: SET");
+    sdc_text(cv, 8, 76, 1, PG_DIM, "DIAL: CHANGE   PRESS: EXIT   K1-K3: SET");
 
     /* banks A (bottom) to D (top), slots left to right */
     int hit = g_pg_lit;
@@ -162,7 +164,10 @@ static void *page_thread(void *arg)
             if (g_pg_api->request(g_pg) != 0) LOG("page: no display yet");
         }
         int up = g_pg_api->has_screen(g_pg);
-        if (up && (g_pg_close || (!g_scale_on && now - g_pg_touch > PAGE_IDLE_MS))) {   /* with Scale on it stays */
+        static int scale_was;
+        int scale_now = g_scale_on, scale_off = scale_was && !scale_now;
+        scale_was = scale_now;
+        if (up && (g_pg_close || scale_off || (!scale_now && now - g_pg_touch > PAGE_IDLE_MS))) {   /* Scale off: gone at once */
             g_pg_api->release(g_pg);
             up = 0;
         }
